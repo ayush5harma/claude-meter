@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+# Emit ONE JSON blob for the "Claude Meter" menu-bar app: the Claude account's
+# real rate-limit utilisation.
+#
+# THE NUMBERS ARE REAL, NOT DERIVED. Claude Code caches the account's actual
+# rate-limit utilisation -- what `/usage` shows -- in `cachedUsageUtilization`
+# in its config file, and the same numbers are served live by the OAuth usage
+# endpoint. Three limits live in `utilization.limits[]`, each with a `percent`,
+# a `resets_at` and a `severity`:
+#   kind=session        the 5-hour window
+#   kind=weekly_all     the weekly limit across all models
+#   kind=weekly_scoped  the weekly limit for premium models
+# Token counts without a denominator are noise, which is what this replaced.
+#
+# SEVERAL IDENTITIES. One Mac can hold more than one Claude Code identity, each
+# in its own config directory (the default ~/.claude, plus anything pointed at
+# by CLAUDE_CONFIG_DIR), and each caches its OWN account's utilisation. All of
+# them are read, and ONE is shown: the identity with the newest LIVE session
+# (Claude Code's registry <config dir>/sessions/<pid>.json, `updatedAt`, pid
+# still alive), the freshest cachedUsageUtilization breaking a tie. An identity
+# WITHOUT that cache is still a candidate: right after a /login the new account
+# has none, and skipping it made the meter wear the other identity's stale
+# account for hours (fixed 2026-09-09). The live API answer is cached per
+# identity AND per email, so a switched account never shows the previous one's
+# numbers. The age of whatever is shown is reported -- a number nobody has
+# refreshed is never presented as current.
+#
+# FAST AND SILENT: a couple of JSON reads plus, at most once per TTL, one
+# bounded HTTPS call. No tokens are ever printed, logged or put in argv.
+#
+# Environment:
+#   CLAUDE_METER_CONFIG_DIRS  colon-separated list of config dirs to consider,
+#                             replacing the default discovery entirely
+#   CLAUDE_CONFIG_DIR         Claude Code's own variable; added to the defaults
+#   CLAUDE_METER_CACHE_DIR    where the API cache, backoff stamp and usage
+#                             history live (default ~/.cache/claude-meter)
+#   USAGE_API_TTL             seconds; overrides the adaptive 120s/900s TTL
+
+set -uo pipefail
+
+# A launchd-spawned shell inherits a sparse PATH, and this script needs
+# python3, security and curl from /usr/bin. Append rather than prepend, so an
+# operator's own PATH still wins.
+case ":$PATH:" in
+  *:/usr/bin:*) ;;
+  *) PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin" ;;
+esac
+export PATH
+
+# The heredoc is deliberately NOT inside $(...): the menu-bar app runs this
+# script with /bin/bash (3.2), whose parser token-scans a heredoc inside command
+# substitution and pairs single quotes naively -- one apostrophe in a Python
+# comment then reads as an unterminated string and the whole script dies at EOF.
+# A plain heredoc redirected to a temp file parses correctly, and frees every
+# future edit from balancing apostrophes.
+py_out="$(mktemp)"
+python3 - <<'PY' >"$py_out" 2>/dev/null
+import json, pathlib, datetime, hashlib, math, os, subprocess, tempfile, time
+
+def load(p):
+    try: return json.loads(pathlib.Path(p).read_text())
+    except Exception: return None
+
+home = pathlib.Path.home()
+
+# ── LIVE usage, from the same endpoint /usage calls ─────────────────────────
+# `cachedUsageUtilization` is only rewritten while claude runs, so reading it
+# alone left the menu bar as fresh as the last session (5 h stale, with an
+# already-expired session window). /usage GETs this endpoint with the profile's
+# OAuth token and the response carries the SAME limits[] shape, so this calls
+# it too.
+#
+# THE ENDPOINT RATE-LIMITS. A 25 s TTL while claude ran is ~120 requests/hour
+# against the app's 30 s poll: the endpoint answered 429 and STAYED 429 because
+# every poll retried instantly, and the meter fell back to the file cache
+# forever while looking live (2026-09-01: 30% shown from a 3 h-old cache while
+# the last good API answer, 7 minutes earlier, said 46%). Three rules fix it:
+#   1. TTL 120 s while a claude process is alive, 900 s idle -- limits move
+#      slowly; ~30 req/h is plenty current and far below the 429 threshold.
+#   2. Any fetch failure writes a BACKOFF stamp (900 s for a 429, 180 s
+#      otherwise) and no network attempt happens while it is fresh.
+#   3. The reading shown is the FRESHEST of (last good API answer, session
+#      file cache), with its age reported -- the first cut ignored the API
+#      cache once past TTL and regressed to older file-cache numbers.
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+CACHE_DIR = pathlib.Path(os.environ.get("CLAUDE_METER_CACHE_DIR") or (home / ".cache" / "claude-meter"))
+API_CACHE = CACHE_DIR / "usage-api.json"
+BACKOFF = CACHE_DIR / "usage-api.backoff"
+
+def _claude_running():
+    try:
+        r = subprocess.run(["pgrep", "-f", r"(^|/)claude($| )"],
+                           capture_output=True, text=True, timeout=5)
+        return r.returncode == 0 and bool(r.stdout.strip())
+    except Exception:
+        return False
+
+API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or (120 if _claude_running() else 900)
+
+DEFAULT_DIR = home / ".claude"
+
+def config_dirs():
+    """Every Claude Code identity to consider, in discovery order.
+
+    CLAUDE_METER_CONFIG_DIRS replaces the list outright. Otherwise: whatever
+    CLAUDE_CONFIG_DIR names, the default ~/.claude, and any ~/.claude-<name>
+    directory that actually holds a config file (that is how a second identity
+    is kept on one Mac -- CLAUDE_CONFIG_DIR pointed at it in the shell that
+    launches it)."""
+    override = os.environ.get("CLAUDE_METER_CONFIG_DIRS", "").strip()
+    raw = []
+    if override:
+        raw = [p for p in override.split(":") if p.strip()]
+    else:
+        raw = [p for p in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":") if p.strip()]
+    dirs = [pathlib.Path(os.path.expanduser(p)) for p in raw]
+    if not override:
+        dirs.append(DEFAULT_DIR)
+        try:
+            for p in sorted(home.glob(".claude-*")):
+                if p.is_dir() and (p / ".claude.json").exists():
+                    dirs.append(p)
+        except Exception:
+            pass
+    seen, out = set(), []
+    for d in dirs:
+        k = str(d)
+        if k not in seen:
+            seen.add(k)
+            out.append(d)
+    return out
+
+def label_for(d):
+    """A short name for the identity, shown beside the account email."""
+    if d == DEFAULT_DIR:
+        return "default"
+    n = d.name.lstrip(".")
+    if n.startswith("claude-"):
+        n = n[len("claude-"):]
+    return n or str(d)
+
+def config_file(d):
+    """Claude Code keeps the DEFAULT identity's config beside its state
+    directory (~/.claude.json, not ~/.claude/.claude.json); a custom
+    CLAUDE_CONFIG_DIR holds both. Prefer whichever actually exists."""
+    cands = [d / ".claude.json"]
+    if d == DEFAULT_DIR:
+        cands.insert(0, home / ".claude.json")
+    for c in cands:
+        if c.exists():
+            return c
+    return cands[0]
+
+def service_for(d):
+    # Claude Code keys its Keychain item to the config dir: the DEFAULT dir uses
+    # the bare name, any other appends sha256(dir)[:8] (verified against a live
+    # keychain). Deriving it beats a ~160 KB `security dump-keychain` per poll
+    # and, more importantly, pins the fetch to THIS account's token -- trying
+    # every token in turn meant one identity's failure could return ANOTHER
+    # account's numbers under the first one's label.
+    if d == DEFAULT_DIR:
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(str(d).encode()).hexdigest()[:8]
+
+def token_for(svc):
+    try:
+        raw = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        o = json.loads(raw).get("claudeAiOauth", {})
+        if o.get("accessToken") and o.get("expiresAt", 0) > time.time() * 1000:
+            return o["accessToken"]
+    except Exception:
+        pass
+    return None
+
+def backoff_state():
+    """(active, why, retry_in_s) from the stamp. The WHY is kept so a poll
+    during backoff can still tell the UI what actually failed -- a silent
+    fallback to the session cache is indistinguishable from freshness, which
+    is exactly the lie this meter exists not to tell."""
+    try:
+        parts = BACKOFF.read_text().split()
+        t, wait = float(parts[0]), float(parts[1])
+        why = parts[2] if len(parts) > 2 else "error"
+        left = t + wait - time.time()
+        return left > 0, why, max(0, int(left))
+    except Exception:
+        return False, "", 0
+
+def set_backoff(seconds, why):
+    try:
+        BACKOFF.parent.mkdir(parents=True, exist_ok=True)
+        BACKOFF.write_text("%d %d %s" % (time.time(), seconds, why))
+    except Exception:
+        pass
+
+def api_cache_load(label, email):
+    # The cache records WHICH account it holds -- the identity label AND the
+    # email: on a machine where the shown identity flips, or where /login moved
+    # an identity to another account, a cached answer for a different account
+    # must read as "no cache", not as data.
+    d = load(API_CACHE)
+    if isinstance(d, dict) and d.get("account") == label and d.get("email", "") == email \
+            and isinstance(d.get("data"), dict):
+        return d["data"], float(d.get("fetched_at") or 0)
+    return None, 0.0
+
+def fetch_live(cfg_dir):
+    """One attempt with THIS identity's token only. Returns (data, errkind)."""
+    tok = token_for(service_for(cfg_dir))
+    if not tok:
+        return None, "token"     # expired/absent: claude refreshes it, not us
+    cfg = None
+    try:
+        # The token reaches curl through a 0600 config file, never argv, so it
+        # cannot show up in `ps`.
+        fd, cfg = tempfile.mkstemp(); os.close(fd); os.chmod(cfg, 0o600)
+        with open(cfg, "w") as f:
+            f.write('header = "Authorization: Bearer %s"\n' % tok)
+            f.write('header = "anthropic-beta: oauth-2025-04-20"\n')
+            f.write('header = "Content-Type: application/json"\n')
+        r = subprocess.run(["curl", "-sS", "--max-time", "15",
+                            "-w", "\n%{http_code}", "--config", cfg, API_URL],
+                           capture_output=True, text=True, timeout=20)
+        body, _, code = r.stdout.rpartition("\n")
+        if code.strip() == "429":
+            return None, "429"
+        d = json.loads(body)
+        if isinstance(d, dict) and d.get("limits"):
+            return d, None
+        return None, "shape"
+    except Exception:
+        return None, "net"
+    finally:
+        if cfg:
+            try: os.unlink(cfg)
+            except Exception: pass
+
+def last_activity(cfg_dir):
+    """Newest updatedAt (seconds) among this identity's LIVE sessions, read from
+    the registry Claude Code keeps in <config dir>/sessions/<pid>.json; 0 when
+    the identity has no live session."""
+    newest = 0.0
+    try:
+        for p in (cfg_dir / "sessions").glob("*.json"):
+            try:
+                s = json.loads(p.read_text())
+                pid = int(s.get("pid") or 0)
+                if pid <= 0: continue
+                os.kill(pid, 0)    # raises when the process is gone
+                newest = max(newest, (s.get("updatedAt") or s.get("startedAt") or 0) / 1000)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return newest
+
+now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+# Roll a PAST resets_at forward ONLY for the weekly limits: their reset is a
+# fixed schedule, so adding whole weeks states a fact. The session window is
+# NOT on a grid -- a new 5 h window anchors on first use after idle -- so rolling
+# it forward fabricated countdowns ("resets in 1h57" for a window that ended
+# hours ago). A past session reset now reports 0 and the app shows a dash.
+CADENCE = {"weekly_all": 7 * 86400, "weekly_scoped": 7 * 86400}
+
+def reset_in(iso, kind=None):
+    if not iso: return 0
+    try:
+        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+    d = t - now
+    if d < 0:
+        cad = CADENCE.get(kind or "", 0)
+        if cad <= 0: return 0
+        d += math.ceil((-d) / cad) * cad
+    return max(0, int(d))
+
+best = None
+for cfg_dir in config_dirs():
+    d = load(config_file(cfg_dir))
+    if not isinstance(d, dict): continue
+    cu = d.get("cachedUsageUtilization")
+    if not isinstance(cu, dict): cu = {}
+    email = ((d.get("oauthAccount") or {}).get("emailAddress") or "")
+    if not cu and not email: continue      # nothing known about this identity
+    fetched = (cu.get("fetchedAtMs") or 0) / 1000
+    rank = (last_activity(cfg_dir), fetched)
+    if best is None or rank > best[0]:
+        best = (rank, fetched, cfg_dir, cu, email)
+
+if best is None:
+    print(json.dumps({"ok": False}))
+else:
+    _, file_at, cfg_dir, cu, email = best
+    label = label_for(cfg_dir)
+
+    api_data, api_at = api_cache_load(label, email)
+    in_backoff, fail_why, retry_in = backoff_state()
+    if (api_data is None or now - api_at >= API_TTL) and not in_backoff:
+        d, err = fetch_live(cfg_dir)
+        if d:
+            api_data, api_at = d, now
+            fail_why, retry_in = "", 0
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                API_CACHE.write_text(json.dumps(
+                    {"account": label, "email": email, "fetched_at": now, "data": d}))
+                if BACKOFF.exists(): BACKOFF.unlink()
+            except Exception:
+                pass
+        else:
+            wait = 900 if err == "429" else 180
+            set_backoff(wait, err)
+            fail_why, retry_in = err, wait
+
+    # FRESHEST WINS, whatever its origin: a 5-minute-old API answer beats a
+    # 3-hour-old session cache even when both are past their nominal TTL.
+    if api_data is not None and api_at >= file_at:
+        u, data_at, source = api_data, api_at, "api"
+    else:
+        u, data_at, source = (cu.get("utilization") or {}), file_at, "session-cache"
+
+    out = {}
+    for L in (u.get("limits") or []):
+        kind = L.get("kind")
+        key = {"session": "session", "weekly_all": "weekly", "weekly_scoped": "scoped"}.get(kind)
+        if not key: continue
+        out[key] = {
+            "pct": int(L.get("percent") or 0),
+            "reset_in": reset_in(L.get("resets_at"), kind),
+            "severity": L.get("severity") or "normal",
+        }
+    # Fall back to the flat structure if limits[] is absent on an older client.
+    for key, src, kind in (("session", "five_hour", "session"), ("weekly", "seven_day", "weekly_all")):
+        if key not in out and isinstance(u.get(src), dict):
+            out[key] = {"pct": int(u[src].get("utilization") or 0),
+                        "reset_in": reset_in(u[src].get("resets_at"), kind),
+                        "severity": "normal"}
+    out["ok"] = True
+    out["account"] = label
+    out["email"] = email
+    out["source"] = source
+    out["age_s"] = max(0, int(now - data_at))
+    out["stale_hours"] = max(0.0, round((now - data_at) / 3600, 1))
+    # Why the live path is not serving, in words the dropdown can print.
+    if fail_why:
+        out["fetch_err"] = {"429": "rate-limited", "token": "no valid token",
+                            "shape": "bad response", "net": "network error",
+                            }.get(fail_why, fail_why)
+        out["retry_in"] = retry_in
+    print(json.dumps(out))
+
+    # Append a history point so the menu can draw a real usage graph. Recorded
+    # only when a value CHANGES or 10 minutes pass: the cache is flat between
+    # claude runs, so polling every 30s would otherwise write ~2880 identical
+    # rows a day for no information. Capped, so the file stays tens of KB.
+    try:
+        hp = CACHE_DIR / "usage-history.csv"
+        hp.parent.mkdir(parents=True, exist_ok=True)
+        row = "%d,%s,%d,%d,%d" % (int(now), label,
+                                  out.get("session", {}).get("pct", 0),
+                                  out.get("weekly", {}).get("pct", 0),
+                                  out.get("scoped", {}).get("pct", 0))
+        prev = hp.read_text().splitlines() if hp.exists() else []
+        keep = True
+        if prev:
+            f = prev[-1].split(",")
+            if len(f) == 5 and f[1:] == row.split(",")[1:] and int(now) - int(f[0]) < 600:
+                keep = False
+        if keep:
+            prev.append(row)
+            hp.write_text("\n".join(prev[-2000:]) + "\n")
+    except Exception:
+        pass
+PY
+claude_json="$(cat "$py_out")"
+rm -f "$py_out"
+[ -n "$claude_json" ] || claude_json='{"ok":false}'
+
+# The app reads root["claude"]; "ts" is when this blob was produced.
+printf '{"claude":%s,"ts":%s}\n' "$claude_json" "$(date +%s)"
