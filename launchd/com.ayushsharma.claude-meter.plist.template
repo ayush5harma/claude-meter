@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The resident agent for Claude Meter. install.sh renders __APP__ (the app's
+  executable) and __LOG__ (the stderr log) and writes the result to
+  ~/Library/LaunchAgents/__LABEL__.plist.
+
+  ProcessType Interactive, not Background: this is a menu-bar item a person
+  looks at, so it must not be throttled into the background band the way a
+  scheduled job should be.
+
+  The wait loop is deliberate. A LaunchAgent can be bootstrapped before the app
+  exists (a fresh machine, a config-management run that installs the agent first)
+  and launchd treats an immediately-failing job as a crash loop; waiting for the
+  binary to appear turns that into one sleeping shell. `exec` is correct here
+  because the FINAL image is the app itself, so launchd still supervises the
+  process it started -- and so the app keeps the agent's identity for KeepAlive.
+
+  StandardOutPath is /dev/null: the app logs nothing on stdout, and a file
+  nothing rotates would only grow. Stderr is kept because that is where the
+  things the app cannot report about itself land (a missing binary, a crash
+  before AppKit is up); in normal operation it stays empty.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>__LABEL__</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-c</string>
+    <string>app="__APP__"; while [ ! -x "$app" ]; do sleep 300; done; exec "$app"</string>
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>StandardOutPath</key><string>/dev/null</string>
+  <key>StandardErrorPath</key><string>__LOG__</string>
+</dict>
+</plist>
