@@ -41,7 +41,7 @@ while [ "$#" -gt 0 ]; do
     --uninstall) MODE=uninstall ;;
     --purge) PURGE=1 ;;
     --force) FORCE="--force" ;;
-    -h|--help) sed -n '2,22p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) printf 'install.sh: unknown argument %s\n' "$1" >&2; exit 64 ;;
   esac
   shift

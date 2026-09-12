@@ -37,7 +37,7 @@ while [ "$#" -gt 0 ]; do
     --force) FORCE=1 ;;
     --out) shift; OUT_DIR="${1:-$DEFAULT_OUT}" ;;
     --out=*) OUT_DIR="${1#--out=}" ;;
-    -h|--help) sed -n '2,26p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
     *) printf 'build.sh: unknown argument %s\n' "$1" >&2; exit 64 ;;
   esac
   shift
