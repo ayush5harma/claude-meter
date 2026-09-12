@@ -1,0 +1,11 @@
+# Build outputs. Nothing in this repo is generated into the repo except the
+# compiler's log, which build.sh deletes on success and leaves behind on
+# failure; the app bundle and its drawn icon are built into the output
+# directory, not here.
+*.app/
+.build.log
+build/
+dist/
+
+# macOS
+.DS_Store
