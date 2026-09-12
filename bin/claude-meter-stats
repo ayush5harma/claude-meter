@@ -34,6 +34,11 @@
 #                             may be "label=path" to name the identity:
 #                             "work=$HOME/.claude:personal=$HOME/.claude-personal".
 #                             A bare path keeps the directory-derived name.
+#                             Give a config dir the SAME absolute path, with no
+#                             trailing slash, that CLAUDE_CONFIG_DIR was given:
+#                             the keychain service is derived from that string,
+#                             so a different spelling of the same directory
+#                             finds no token.
 #   CLAUDE_CONFIG_DIR         Claude Code's own variable; added to the defaults
 #   CLAUDE_METER_CACHE_DIR    where the API cache, backoff stamp and usage
 #                             history live (default ~/.cache/claude-meter)
@@ -58,7 +63,7 @@ export PATH
 # future edit from balancing apostrophes.
 py_out="$(mktemp)"
 python3 - <<'PY' >"$py_out" 2>/dev/null
-import json, pathlib, datetime, hashlib, math, os, subprocess, tempfile, time
+import json, pathlib, datetime, hashlib, math, os, subprocess, time
 
 def load(p):
     try: return json.loads(pathlib.Path(p).read_text())
@@ -182,6 +187,12 @@ def service_for(d):
     # and, more importantly, pins the fetch to THIS account's token -- trying
     # every token in turn meant one identity's failure could return ANOTHER
     # account's numbers under the first one's label.
+    #
+    # The hash is over the PATH STRING, so it is only ever as right as the
+    # spelling it is given: pass the same absolute path Claude Code was given.
+    # Nothing here resolves symlinks or rewrites the path to "fix" a mismatch --
+    # a normalisation this script invented would just be a second spelling to
+    # be wrong in, and it would fail silently as "no valid token".
     if d == DEFAULT_DIR:
         return "Claude Code-credentials"
     return "Claude Code-credentials-" + hashlib.sha256(str(d).encode()).hexdigest()[:8]
@@ -213,7 +224,7 @@ def backoff_state():
 
 def set_backoff(seconds, why):
     try:
-        BACKOFF.parent.mkdir(parents=True, exist_ok=True)
+        BACKOFF.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         BACKOFF.write_text("%d %d %s" % (time.time(), seconds, why))
     except Exception:
         pass
@@ -234,18 +245,18 @@ def fetch_live(cfg_dir):
     tok = token_for(service_for(cfg_dir))
     if not tok:
         return None, "token"     # expired/absent: claude refreshes it, not us
-    cfg = None
     try:
-        # The token reaches curl through a 0600 config file, never argv, so it
-        # cannot show up in `ps`.
-        fd, cfg = tempfile.mkstemp(); os.close(fd); os.chmod(cfg, 0o600)
-        with open(cfg, "w") as f:
-            f.write('header = "Authorization: Bearer %s"\n' % tok)
-            f.write('header = "anthropic-beta: oauth-2025-04-20"\n')
-            f.write('header = "Content-Type: application/json"\n')
+        # The token reaches curl on STDIN (`--config -`), never argv and never a
+        # file: argv is world-readable through `ps`, and a temporary file -- even
+        # one created 0600 and unlinked in a finally -- still puts the token on
+        # disk, where a crash between write and unlink leaves it. A pipe exists
+        # only between these two processes and dies with them.
+        cfg = ('header = "Authorization: Bearer %s"\n'
+               'header = "anthropic-beta: oauth-2025-04-20"\n'
+               'header = "Content-Type: application/json"\n' % tok)
         r = subprocess.run(["curl", "-sS", "--max-time", "15",
-                            "-w", "\n%{http_code}", "--config", cfg, API_URL],
-                           capture_output=True, text=True, timeout=20)
+                            "-w", "\n%{http_code}", "--config", "-", API_URL],
+                           input=cfg, capture_output=True, text=True, timeout=20)
         body, _, code = r.stdout.rpartition("\n")
         if code.strip() == "429":
             return None, "429"
@@ -255,10 +266,6 @@ def fetch_live(cfg_dir):
         return None, "shape"
     except Exception:
         return None, "net"
-    finally:
-        if cfg:
-            try: os.unlink(cfg)
-            except Exception: pass
 
 def last_activity(cfg_dir):
     """Newest updatedAt (seconds) among this identity's LIVE sessions, read from
@@ -328,9 +335,13 @@ else:
             api_data, api_at = d, now
             fail_why, retry_in = "", 0
             try:
-                CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                # 0700/0600: this file holds the account's email address and the
+                # full usage response. Nothing here is a credential, but it is
+                # this user's data and no other account on the Mac needs it.
+                CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
                 API_CACHE.write_text(json.dumps(
                     {"account": label, "email": email, "fetched_at": now, "data": d}))
+                os.chmod(API_CACHE, 0o600)
                 if BACKOFF.exists(): BACKOFF.unlink()
             except Exception:
                 pass
@@ -373,46 +384,65 @@ else:
             out[key] = {"pct": int(u[src].get("utilization") or 0),
                         "reset_in": reset_in(u[src].get("resets_at"), kind),
                         "severity": "normal"}
-    out["ok"] = True
-    out["account"] = label
-    out["email"] = email
-    # What the scoped weekly cap applies to, for the UI to print. "Model" is the
-    # honest placeholder when the response names nothing -- better a generic
-    # word than a family name this script invented.
-    out["scoped_label"] = scoped_label or "Model"
-    out["source"] = source
-    out["age_s"] = max(0, int(now - data_at))
-    out["stale_hours"] = max(0.0, round((now - data_at) / 3600, 1))
-    # Why the live path is not serving, in words the dropdown can print.
-    if fail_why:
-        out["fetch_err"] = {"429": "rate-limited", "token": "no valid token",
-                            "shape": "bad response", "net": "network error",
-                            }.get(fail_why, fail_why)
-        out["retry_in"] = retry_in
-    print(json.dumps(out))
+    # NOTHING TO SHOW IS NOT "ok". An identity can be known by its email alone
+    # -- a fresh /login whose cachedUsageUtilization has not been written yet --
+    # and with the live path down that leaves no limits and no timestamp to age
+    # them by. Emitted as ok:true (measured 2026-09-12) that produced
+    # {"ok": true, "source": "session-cache", "age_s": 1789211658} -- the raw
+    # epoch, because the age is computed against a data_at of 0 -- and the app,
+    # which gates only on ok, painted three grey 0% bars as if they were real.
+    # A missing timestamp is disqualifying on its own: this meter's contract is
+    # that every number carries its age, so a reading that cannot be aged is
+    # not a reading. ok:false selects the app's own empty state, a dash.
+    if data_at <= 0 or not any(k in out for k in ("session", "weekly", "scoped")):
+        print(json.dumps({"ok": False}))
+    else:
+        out["ok"] = True
+        out["account"] = label
+        out["email"] = email
+        # What the scoped weekly cap applies to, for the UI to print. "Model" is
+        # the honest placeholder when the response names nothing -- better a
+        # generic word than a family name this script invented.
+        out["scoped_label"] = scoped_label or "Model"
+        out["source"] = source
+        out["age_s"] = max(0, int(now - data_at))
+        out["stale_hours"] = max(0.0, round((now - data_at) / 3600, 1))
+        # Why the live path is not serving, in words the dropdown can print.
+        if fail_why:
+            out["fetch_err"] = {"429": "rate-limited", "token": "no valid token",
+                                "shape": "bad response", "net": "network error",
+                                }.get(fail_why, fail_why)
+            out["retry_in"] = retry_in
+        print(json.dumps(out))
 
-    # Append a history point so the menu can draw a real usage graph. Recorded
-    # only when a value CHANGES or 10 minutes pass: the cache is flat between
-    # claude runs, so polling every 30s would otherwise write ~2880 identical
-    # rows a day for no information. Capped, so the file stays tens of KB.
-    try:
-        hp = CACHE_DIR / "usage-history.csv"
-        hp.parent.mkdir(parents=True, exist_ok=True)
-        row = "%d,%s,%d,%d,%d" % (int(now), label,
-                                  out.get("session", {}).get("pct", 0),
-                                  out.get("weekly", {}).get("pct", 0),
-                                  out.get("scoped", {}).get("pct", 0))
-        prev = hp.read_text().splitlines() if hp.exists() else []
-        keep = True
-        if prev:
-            f = prev[-1].split(",")
-            if len(f) == 5 and f[1:] == row.split(",")[1:] and int(now) - int(f[0]) < 600:
-                keep = False
-        if keep:
-            prev.append(row)
-            hp.write_text("\n".join(prev[-2000:]) + "\n")
-    except Exception:
-        pass
+        # Append a history point so the menu can draw a real usage graph.
+        # Recorded only when a value CHANGES or 10 minutes pass: the cache is
+        # flat between claude runs, so polling every 30s would otherwise write
+        # ~2880 identical rows a day for no information. Capped, so the file
+        # stays tens of KB.
+        try:
+            hp = CACHE_DIR / "usage-history.csv"
+            hp.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+            # The label is user-supplied (CLAUDE_METER_CONFIG_DIRS), and this is
+            # a five-field CSV parsed by position: a comma in it would shift
+            # every later field and the row would be dropped as malformed by the
+            # reader -- and by the dedupe check here, which rewrites the whole
+            # file every poll.
+            row = "%d,%s,%d,%d,%d" % (int(now), label.replace(",", "-"),
+                                      out.get("session", {}).get("pct", 0),
+                                      out.get("weekly", {}).get("pct", 0),
+                                      out.get("scoped", {}).get("pct", 0))
+            prev = hp.read_text().splitlines() if hp.exists() else []
+            keep = True
+            if prev:
+                f = prev[-1].split(",")
+                if len(f) == 5 and f[1:] == row.split(",")[1:] and int(now) - int(f[0]) < 600:
+                    keep = False
+            if keep:
+                prev.append(row)
+                hp.write_text("\n".join(prev[-2000:]) + "\n")
+        except Exception:
+            pass
 PY
 claude_json="$(cat "$py_out")"
 rm -f "$py_out"

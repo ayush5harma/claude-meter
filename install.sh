@@ -58,13 +58,35 @@ unload_agent() {
 if [ "$MODE" = uninstall ]; then
   unload_agent
   say "agent $AGENT_LABEL unloaded"
-  rm -f "$PLIST" && say "removed $PLIST"
-  rm -f "$STATS" && say "removed $STATS"
+  # Say "removed" only about something that was there: `rm -f` succeeds on a
+  # path that never existed, and an uninstaller that reports work it did not do
+  # is the same lie as a meter reporting a number it did not fetch.
+  for p in "$PLIST" "$STATS"; do
+    if [ -e "$p" ]; then rm -f "$p" && say "removed $p"; fi
+  done
   if [ -d "$BUNDLE" ]; then
     rm -rf "$BUNDLE" && say "removed $BUNDLE"
   fi
   if [ "$PURGE" -eq 1 ]; then
-    rm -rf "$CACHE_DIR" && say "removed $CACHE_DIR"
+    # CLAUDE_METER_CACHE_DIR is an environment variable, so it can arrive empty
+    # or as something no uninstaller should ever recurse into. Refuse anything
+    # that is not an absolute path at least three levels deep and holding at
+    # least one of this app's own files -- `rm -rf` does not get the benefit of
+    # the doubt.
+    # The trailing newline matters: awk reads no line at all from an empty
+    # string, prints nothing, and the numeric test below would then error out
+    # rather than refuse -- which is how CACHE_DIR="/" would have slipped past.
+    depth="$(printf '%s\n' "${CACHE_DIR%/}" | awk -F/ '{print NF-1}')"
+    if [ -z "$CACHE_DIR" ] || [ "${CACHE_DIR#/}" = "$CACHE_DIR" ] || [ "${depth:-0}" -lt 2 ]; then
+      say "refusing to delete '$CACHE_DIR' — not a plausible cache directory"
+    elif [ ! -d "$CACHE_DIR" ]; then
+      say "no cache at $CACHE_DIR"
+    elif [ ! -e "$CACHE_DIR/usage-api.json" ] && [ ! -e "$CACHE_DIR/usage-history.csv" ] \
+         && [ ! -e "$CACHE_DIR/usage-api.backoff" ] && [ ! -e "$CACHE_DIR/claude-meter.launchd.log" ]; then
+      say "refusing to delete $CACHE_DIR — it holds none of this app's files"
+    else
+      rm -rf "$CACHE_DIR" && say "removed $CACHE_DIR"
+    fi
   else
     say "kept $CACHE_DIR (pass --purge to delete the usage history too)"
   fi

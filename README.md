@@ -52,7 +52,9 @@ freshness, which is the one lie a meter must not tell.
 
 ## Requirements
 
-- macOS 14 or later (the bundle declares `LSMinimumSystemVersion` 14.0).
+- macOS. Built and used on macOS 26 and 27. The sources use no API newer than
+  macOS 14 and the bundle declares `LSMinimumSystemVersion` 14.0, but nothing
+  older than 26 has been tested — treat 14 to 25 as unverified.
 - Xcode Command Line Tools, for `swiftc`: `xcode-select --install`.
   Full Xcode is optional — it supplies `actool`, which compiles the
   appearance-aware (light and dark) app icon. Without it the build falls back
@@ -67,7 +69,7 @@ freshness, which is the one lie a meter must not tell.
 ## Install
 
 ```sh
-git clone <this repo> claude-meter
+git clone https://github.com/ayush5harma/claude-meter
 cd claude-meter
 bash install.sh
 ```
@@ -76,8 +78,18 @@ That builds `Claude Meter.app` into `/Applications`, installs the collector to
 `~/.local/bin/claude-meter-stats`, renders
 `launchd/com.ayushsharma.claude-meter.plist.template` into
 `~/Library/LaunchAgents/`, and loads the agent. The item appears in the menu bar
-within a few seconds. Everything it touches belongs to your user: no `sudo`, no
-system directories.
+within a few seconds.
+
+Nothing here needs `sudo`, but `/Applications` is writable only by an admin
+account. On a standard account, install per-user instead — the bundle works
+anywhere, and Finder and Spotlight already know `~/Applications`:
+
+```sh
+APP_DIR="$HOME/Applications" bash install.sh
+```
+
+Everything else it writes is yours: `~/.local/bin`, `~/Library/LaunchAgents`
+and `~/.cache/claude-meter`.
 
 Build without installing anything (useful for trying a change while the
 installed meter keeps running):
@@ -113,7 +125,10 @@ bash uninstall.sh --purge    # also delete ~/.cache/claude-meter
 
 Unloads the agent and removes the plist, the collector and the app. The cache
 (the API answer, the backoff stamp and the usage history) is kept unless you
-pass `--purge`.
+pass `--purge`, and `--purge` refuses to delete anything that is not an absolute
+path at least two levels deep holding at least one of this app's own files —
+`CLAUDE_METER_CACHE_DIR` is an environment variable, and `rm -rf` does not get
+the benefit of the doubt.
 
 ---
 
@@ -157,6 +172,14 @@ for any other. Deriving it pins each fetch to that identity's own token — the
 alternative, trying every token in turn, means one identity's failure can return
 another account's numbers under the first one's name.
 
+Because that hash is over the **path string**, give a directory the same
+absolute path, with no trailing slash, that `CLAUDE_CONFIG_DIR` was given.
+`/Users/you/.claude-work` and `/Users/you/.claude-work/` hash differently, and
+so does a path through a symlink. Nothing in the collector resolves or rewrites
+the path to paper over a mismatch: a normalisation this app invented would just
+be one more spelling to be wrong in, and the failure is quiet — the dropdown
+says `no valid token` and falls back to Claude Code's own cached numbers.
+
 Labels in the UI come from the directory: `~/.claude` is `default`,
 `~/.claude-personal` is `personal`.
 
@@ -177,8 +200,13 @@ is opened). The collector does **not** call the network every time.
   Code's own session cache, whichever that is, with its age reported.
 - The API answer is cached per identity **and** per account email, so switching
   accounts can never show the previous one's numbers.
-- The token reaches `curl` through a mode-0600 config file, never through argv,
-  so it cannot appear in `ps`. Nothing prints or logs it.
+- The token reaches `curl` on **stdin** (`--config -`), never through argv and
+  never through a file: argv is readable by any process through `ps`, and a
+  temporary file puts the token on disk even if it is created 0600 and deleted
+  afterwards. Nothing prints or logs it.
+- The cache directory is created 0700 and `usage-api.json` is written 0600: it
+  is not a credential, but it holds the account's email and the full usage
+  response, and no other account on the Mac needs either.
 - A history point is appended only when a value changes or 10 minutes pass, and
   the file is capped at 2000 rows — a few tens of KB.
 
@@ -235,6 +263,18 @@ global is touched, because `NSStatusBar.system` registers the process with
 LaunchServices as a running copy of this app — and the UI's single-instance
 sweep then kills the `--run` parent mid-job (measured 2026-09-06).
 
+**Know what this costs.** The flag is not a privilege check: anything already
+running as you can borrow this app's grants by exec'ing `ClaudeMeter --run`.
+That is the same trust boundary every program you run already sits inside, but
+it means the grants you give this bundle are effectively grants to your whole
+user session — so give it only what you would give any program you run, and if
+that is more than you want to hand out, install a separate ad-hoc bundle for the
+job that needs the grant rather than widening this one.
+
+Ad-hoc signing also means the code directory hash changes on every rebuild, so
+macOS may ask you to approve a grant again after `build.sh` — that prompt is
+expected, and it is the system noticing the binary is genuinely different.
+
 ---
 
 ## Data contract
@@ -259,7 +299,7 @@ The app reads `root["claude"]` and, inside it:
 
 | Field | Type | Meaning |
 |---|---|---|
-| `ok` | bool | False (and nothing else) when no identity could be read. |
+| `ok` | bool | False **and nothing else** when there is nothing honest to show: no identity could be read, or the chosen one has no limits, or has no timestamp to age them by. The app paints its empty state (a dash) rather than a 0%. |
 | `account` | string | Identity label, e.g. `default`, `personal`. |
 | `email` | string | The account's email, shown in the dropdown header. |
 | `source` | string | `api` (live endpoint) or `session-cache` (Claude Code's own file). |

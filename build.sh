@@ -71,7 +71,15 @@ if [ "$FORCE" -eq 0 ] && [ -x "$BIN" ] \
   exit 0
 fi
 
-mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources" || exit 1
+if ! mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"; then
+  # /Applications is writable by admin accounts only. A standard account is not
+  # stuck: the bundle works anywhere, and ~/Applications is a per-user location
+  # Finder and Spotlight already know about.
+  say "cannot write to $OUT_DIR"
+  [ "$OUT_DIR" = "$DEFAULT_OUT" ] && \
+    say "for a per-user install: APP_DIR=\"\$HOME/Applications\" bash install.sh"
+  exit 1
+fi
 
 # CFBundleIdentifier is load-bearing and deliberately stable: macOS keys every
 # TCC privacy grant (and the single-instance sweep in main.swift) to it, so
