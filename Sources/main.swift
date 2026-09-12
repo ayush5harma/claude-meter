@@ -91,6 +91,11 @@ struct Stats {
     var fetchErr = ""        // why the live path is down ("rate-limited", ...)
     var retryIn = 0          // seconds until the collector tries the API again
     var session = Limit(), weekly = Limit(), scoped = Limit()
+    // What the scoped weekly cap applies to. The usage endpoint names it
+    // (limits[].scope.model.display_name), so nothing here hardcodes a model
+    // family that a release would falsify; "Model" is the placeholder for a
+    // response, or an older collector, that names nothing.
+    var scopedLabel = "Model"
 }
 
 // MARK: - Formatting
@@ -465,6 +470,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.ageS = c["age_s"] as? Int ?? Int(((c["stale_hours"] as? Double) ?? -1) * 3600)
             s.fetchErr = c["fetch_err"] as? String ?? ""
             s.retryIn = c["retry_in"] as? Int ?? 0
+            if let sl = c["scoped_label"] as? String, !sl.isEmpty { s.scopedLabel = sl }
             func lim(_ k: String) -> Limit {
                 guard let d = c[k] as? [String: Any] else { return Limit() }
                 return Limit(pct: d["pct"] as? Int ?? 0, reset: d["reset_in"] as? Int ?? 0,
@@ -496,8 +502,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         b.image = barsGlyph(limits, badge: badge)
         // The number is the SESSION % — the value that moves while working —
         // unless another limit is hot, in which case the hot one takes over
-        // with its label so the number stays self-describing ("wk 92%").
-        let named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly), ("pm", stats.scoped)]
+        // with its label so the number stays self-describing ("wk 92%"). The
+        // scoped limit brings the name the endpoint gave it, truncated because
+        // the menu bar is not elastic and a model name is not bounded.
+        let named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly),
+                                        (String(stats.scopedLabel.prefix(12)), stats.scoped)]
         let worst = named.enumerated().max {
             (alertLevel($0.element.1), $0.element.1.pct) < (alertLevel($1.element.1), $1.element.1.pct)
         }!
@@ -580,7 +589,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if haveStats, stats.ok {
             freshnessLine(m)
             let g = UsageGraph(frame: NSRect(x: 0, y: 0, width: 340, height: 176))
-            g.limits = [("Session", stats.session), ("Week", stats.weekly), ("Premium", stats.scoped)]
+            g.limits = [("Session", stats.session), ("Week", stats.weekly), (stats.scopedLabel, stats.scoped)]
             g.history = loadHistory()
             let gi = NSMenuItem(); gi.view = g; m.addItem(gi)
         } else if haveStats {

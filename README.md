@@ -18,11 +18,13 @@ build, and the result is ad-hoc signed. Nothing is fetched, nothing is vendored.
 ## What it shows
 
 **In the menu bar:** a 16 px glyph of three stacked mini-bars — session on top,
-week in the middle, premium week at the bottom — and one number beside it.
+week in the middle, the scoped weekly cap at the bottom — and one number beside
+it.
 
 - The number is the **session** percentage, the one that moves while you work.
 - If another limit goes hot, that one takes the number over and brings its own
-  label with it, so the number is always self-describing: `wk 92%`, `pm 78%`.
+  label with it, so the number is always self-describing: `wk 92%`, or the model
+  name the usage endpoint gave the scoped cap, `Fable 78%`.
 - A bar is blue, purple or teal by series so three limits sitting at similar low
   percentages can still be told apart. At 75% or a `warning` severity it turns
   orange; at 90% or `critical`, red.
@@ -35,7 +37,9 @@ week in the middle, premium week at the bottom — and one number beside it.
 
 **In the dropdown:** the account email and which identity it belongs to; one
 line saying where the numbers came from and how old they are; a full-width
-gauge per limit with its exact percentage and time to reset; and a graph of how
+gauge per limit with its exact percentage and time to reset — the third one
+named by the endpoint itself, so it says which model family the cap is for
+rather than a word this app invented; and a graph of how
 the three limits have moved over the recorded history, auto-scaled to the peak
 with the top tick labelled (on a fixed 0–100 axis these limits flatline along
 the bottom most of the time — honest, and useless).
@@ -124,6 +128,20 @@ account's utilisation. The collector reads all of them and shows exactly one.
 1. `CLAUDE_METER_CONFIG_DIRS` (colon-separated) replaces the list entirely.
 2. Otherwise: whatever `CLAUDE_CONFIG_DIR` names, then the default `~/.claude`,
    then any `~/.claude-<name>` directory that actually holds a `.claude.json`.
+
+**Naming them yourself.** An entry in `CLAUDE_METER_CONFIG_DIRS` may be
+`label=path` instead of a bare path, and the label is then what the dropdown
+header and the usage history record:
+
+```sh
+CLAUDE_METER_CONFIG_DIRS="work=$HOME/.claude:personal=$HOME/.claude-personal"
+```
+
+A bare path keeps the directory-derived name. The `label=path` form is
+recognised only when the part before the first `=` is a bare name with no `/`
+in it, so a directory whose own name contains an `=` is still read as a path.
+Set the variable in whatever launches the meter — for the launchd agent, add an
+`EnvironmentVariables` dict to the plist.
 
 **Which one is shown:** the identity with the newest **live** session — Claude
 Code's own registry at `<config dir>/sessions/<pid>.json`, `updatedAt`, with the
@@ -250,9 +268,24 @@ The app reads `root["claude"]` and, inside it:
 | `fetch_err` | string | Why the live path is down: `rate-limited`, `no valid token`, `bad response`, `network error`. Absent when it is up. |
 | `retry_in` | int | Seconds until the collector will try the endpoint again. |
 | `session`, `weekly`, `scoped` | object | One per limit: `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity` (`normal` / `warning` / `critical`). |
+| `scoped_label` | string | What the `scoped` cap applies to, for the UI to print. |
 
-`scoped` is the weekly cap for premium models; the UI calls it "Premium" in the
-dropdown and `pm` in the bar.
+`scoped` is the weekly cap that applies to one model family rather than to
+everything. Which family is not hardcoded anywhere: the usage endpoint reports
+it per limit in `limits[].scope.model.display_name`, and the collector passes
+that through as `scoped_label` (inspected 2026-09-12: `scope` is null on the
+session and all-models limits and carries `{"model": {"id": null,
+"display_name": "…"}, "surface": null}` on `weekly_scoped`; the flat legacy keys
+beside `limits[]`, `seven_day_opus` and friends, were null in the same response
+and are not a second source). When the response names nothing the collector
+emits `"Model"`, and the app also falls back to `"Model"` if the field is absent
+entirely — an older collector, say. The app truncates it to 12 characters in the
+menu bar, where width is not free, and prints it in full in the dropdown.
+
+**Collector environment** — `CLAUDE_METER_CONFIG_DIRS` (colon-separated config
+dirs, each optionally `label=path`, replacing discovery), `CLAUDE_CONFIG_DIR`
+(Claude Code's own, added to the defaults), `CLAUDE_METER_CACHE_DIR`,
+`USAGE_API_TTL`.
 
 The app locates the collector at: `$CLAUDE_METER_STATS`, then
 `~/.local/bin/claude-meter-stats`, then `/usr/local/bin/claude-meter-stats`,

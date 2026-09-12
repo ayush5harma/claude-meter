@@ -30,7 +30,10 @@
 #
 # Environment:
 #   CLAUDE_METER_CONFIG_DIRS  colon-separated list of config dirs to consider,
-#                             replacing the default discovery entirely
+#                             replacing the default discovery entirely. An entry
+#                             may be "label=path" to name the identity:
+#                             "work=$HOME/.claude:personal=$HOME/.claude-personal".
+#                             A bare path keeps the directory-derived name.
 #   CLAUDE_CONFIG_DIR         Claude Code's own variable; added to the defaults
 #   CLAUDE_METER_CACHE_DIR    where the API cache, backoff stamp and usage
 #                             history live (default ~/.cache/claude-meter)
@@ -99,39 +102,60 @@ API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or (120 if _claude_running()
 
 DEFAULT_DIR = home / ".claude"
 
-def config_dirs():
-    """Every Claude Code identity to consider, in discovery order.
+def parse_entry(spec):
+    """One CLAUDE_METER_CONFIG_DIRS entry: "path", or "label=path" to name the
+    identity yourself instead of taking the name from the directory.
 
-    CLAUDE_METER_CONFIG_DIRS replaces the list outright. Otherwise: whatever
-    CLAUDE_CONFIG_DIR names, the default ~/.claude, and any ~/.claude-<name>
-    directory that actually holds a config file (that is how a second identity
-    is kept on one Mac -- CLAUDE_CONFIG_DIR pointed at it in the shell that
-    launches it)."""
+    The label form is recognised only when the part before the first "=" is a
+    bare name -- no "/" in it -- so a directory whose own name contains an "="
+    is still read as a path. Returns (path, label or None)."""
+    head, sep, tail = spec.partition("=")
+    if sep and head.strip() and "/" not in head and tail.strip():
+        return pathlib.Path(os.path.expanduser(tail.strip())), head.strip()
+    return pathlib.Path(os.path.expanduser(spec.strip())), None
+
+def config_dirs():
+    """Every Claude Code identity to consider, as (path, label or None), in
+    discovery order.
+
+    CLAUDE_METER_CONFIG_DIRS replaces the list outright, and its entries may
+    carry labels ("work=~/.claude:personal=~/.claude-personal"). Otherwise:
+    whatever CLAUDE_CONFIG_DIR names, the default ~/.claude, and any
+    ~/.claude-<name> directory that actually holds a config file (that is how a
+    second identity is kept on one Mac -- CLAUDE_CONFIG_DIR pointed at it in the
+    shell that launches it)."""
     override = os.environ.get("CLAUDE_METER_CONFIG_DIRS", "").strip()
-    raw = []
-    if override:
-        raw = [p for p in override.split(":") if p.strip()]
-    else:
-        raw = [p for p in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":") if p.strip()]
-    dirs = [pathlib.Path(os.path.expanduser(p)) for p in raw]
-    if not override:
-        dirs.append(DEFAULT_DIR)
-        try:
-            for p in sorted(home.glob(".claude-*")):
-                if p.is_dir() and (p / ".claude.json").exists():
-                    dirs.append(p)
-        except Exception:
-            pass
     seen, out = set(), []
-    for d in dirs:
+    def add(d, label=None):
         k = str(d)
         if k not in seen:
             seen.add(k)
-            out.append(d)
+            out.append((d, label))
+    if override:
+        for spec in override.split(":"):
+            if spec.strip():
+                d, label = parse_entry(spec)
+                add(d, label)
+        return out
+    for p in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":"):
+        if p.strip():
+            add(pathlib.Path(os.path.expanduser(p.strip())))
+    add(DEFAULT_DIR)
+    try:
+        for p in sorted(home.glob(".claude-*")):
+            if p.is_dir() and (p / ".claude.json").exists():
+                add(p)
+    except Exception:
+        pass
     return out
 
-def label_for(d):
-    """A short name for the identity, shown beside the account email."""
+def label_for(d, override=None):
+    """A short name for the identity, shown beside the account email. An
+    explicit label from CLAUDE_METER_CONFIG_DIRS wins: the name is what a
+    person recognises the account by, and the directory it happens to live in
+    need not say it."""
+    if override:
+        return override
     if d == DEFAULT_DIR:
         return "default"
     n = d.name.lstrip(".")
@@ -278,7 +302,7 @@ def reset_in(iso, kind=None):
     return max(0, int(d))
 
 best = None
-for cfg_dir in config_dirs():
+for cfg_dir, label_override in config_dirs():
     d = load(config_file(cfg_dir))
     if not isinstance(d, dict): continue
     cu = d.get("cachedUsageUtilization")
@@ -288,13 +312,13 @@ for cfg_dir in config_dirs():
     fetched = (cu.get("fetchedAtMs") or 0) / 1000
     rank = (last_activity(cfg_dir), fetched)
     if best is None or rank > best[0]:
-        best = (rank, fetched, cfg_dir, cu, email)
+        best = (rank, fetched, cfg_dir, cu, email, label_override)
 
 if best is None:
     print(json.dumps({"ok": False}))
 else:
-    _, file_at, cfg_dir, cu, email = best
-    label = label_for(cfg_dir)
+    _, file_at, cfg_dir, cu, email, label_override = best
+    label = label_for(cfg_dir, label_override)
 
     api_data, api_at = api_cache_load(label, email)
     in_backoff, fail_why, retry_in = backoff_state()
@@ -323,6 +347,7 @@ else:
         u, data_at, source = (cu.get("utilization") or {}), file_at, "session-cache"
 
     out = {}
+    scoped_label = ""
     for L in (u.get("limits") or []):
         kind = L.get("kind")
         key = {"session": "session", "weekly_all": "weekly", "weekly_scoped": "scoped"}.get(kind)
@@ -332,6 +357,16 @@ else:
             "reset_in": reset_in(L.get("resets_at"), kind),
             "severity": L.get("severity") or "normal",
         }
+        if key == "scoped":
+            # THE ENDPOINT NAMES THE CAP ITSELF, so nothing here hardcodes a
+            # model family that will be wrong at the next release. Inspected
+            # 2026-09-12: every limits[] entry carries `scope`, null on the
+            # session and all-models limits and, on weekly_scoped,
+            # {"model": {"id": null, "display_name": "<name>"}, "surface": null}.
+            # The flat legacy keys beside limits[] (seven_day_opus and friends)
+            # were null in the same response, so they are not a second source.
+            m = (L.get("scope") or {}).get("model") or {}
+            scoped_label = (m.get("display_name") or "").strip()
     # Fall back to the flat structure if limits[] is absent on an older client.
     for key, src, kind in (("session", "five_hour", "session"), ("weekly", "seven_day", "weekly_all")):
         if key not in out and isinstance(u.get(src), dict):
@@ -341,6 +376,10 @@ else:
     out["ok"] = True
     out["account"] = label
     out["email"] = email
+    # What the scoped weekly cap applies to, for the UI to print. "Model" is the
+    # honest placeholder when the response names nothing -- better a generic
+    # word than a family name this script invented.
+    out["scoped_label"] = scoped_label or "Model"
     out["source"] = source
     out["age_s"] = max(0, int(now - data_at))
     out["stale_hours"] = max(0.0, round((now - data_at) / 3600, 1))
