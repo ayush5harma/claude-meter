@@ -116,6 +116,16 @@ esac
 # The log directory must exist before bootstrap: launchd refuses a job whose
 # StandardErrorPath cannot be opened.
 mkdir -p "$CACHE_DIR" "$(dirname "$PLIST")" || exit 1
+# A plist that is a symlink belongs to something else (a nix-darwin or
+# home-manager switch links agents into ~/Library/LaunchAgents from the Nix
+# store, read-only): writing over it fails as "Permission denied" and, worse,
+# would silently take an agent away from its owner. Measured 2026-09-13 on a
+# flake-managed Mac. Say so and stop; that Mac gets the app from its flake.
+if [ -L "$PLIST" ]; then
+  say "$PLIST is a symlink, so another tool manages this agent (a Nix flake?);"
+  say "not touching it. Uninstall that first, or leave Claude Meter to it."
+  exit 1
+fi
 sed -e "s|__LABEL__|$AGENT_LABEL|g" \
     -e "s|__APP__|$APP_BIN|g" \
     -e "s|__LOG__|$LOG|g" \
