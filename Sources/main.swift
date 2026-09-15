@@ -24,7 +24,7 @@
 
 import AppKit
 
-// MARK: CLI mode — run a command under this app's identity
+// MARK: - CLI mode — run a command under this app's identity
 //
 // `ClaudeMeter --run <program> [args…]` runs the program as a CHILD of this
 // binary and waits for it. The point is macOS's per-app privacy model: TCC
@@ -48,23 +48,23 @@ func runUnderThisIdentity(_ argv: [String]) -> Never {
         FileHandle.standardError.write(Data("usage: ClaudeMeter --run <program> [args…]\n".utf8))
         exit(64)
     }
-    let p = Process()
-    p.executableURL = URL(fileURLWithPath: program)
-    p.arguments = Array(argv.dropFirst())
-    p.standardInput = FileHandle.standardInput
-    p.standardOutput = FileHandle.standardOutput
-    p.standardError = FileHandle.standardError
-    cliChild = p
+    let child = Process()
+    child.executableURL = URL(fileURLWithPath: program)
+    child.arguments = Array(argv.dropFirst())
+    child.standardInput = FileHandle.standardInput
+    child.standardOutput = FileHandle.standardOutput
+    child.standardError = FileHandle.standardError
+    cliChild = child
     // launchd stops a job with SIGTERM; pass it on so the child's own exit trap
     // runs instead of leaving its locks and temporary state behind.
     signal(SIGTERM) { _ in cliChild?.terminate() }
     signal(SIGINT) { _ in cliChild?.interrupt() }
-    do { try p.run() } catch {
+    do { try child.run() } catch {
         FileHandle.standardError.write(Data("ClaudeMeter: cannot run \(program): \(error)\n".utf8))
         exit(126)
     }
-    p.waitUntilExit()
-    exit(p.terminationStatus)
+    child.waitUntilExit()
+    exit(child.terminationStatus)
 }
 
 let cliArgs = Array(CommandLine.arguments.dropFirst())
@@ -73,14 +73,15 @@ if cliArgs.first == "--run" { runUnderThisIdentity(Array(cliArgs.dropFirst())) }
 
 // MARK: - Paths
 
-// Everything this app reads or writes outside the collector lives here. One
-// directory, so uninstalling is a single `rm -rf`.
+// The collector's cache directory, the only place outside the collector this
+// app reads. It does NOT follow CLAUDE_METER_CACHE_DIR, which the collector
+// does: point that elsewhere and the dropdown's history graph goes empty.
 let cacheDir = FileManager.default.homeDirectoryForCurrentUser
     .appendingPathComponent(".cache/claude-meter")
 
 // MARK: - Model
 
-struct Limit { var pct = 0; var reset = 0; var severity = "normal" }
+struct Limit { var pct = 0; var resetIn = 0; var severity = "normal" }
 
 struct Stats {
     var ok = false
@@ -100,22 +101,26 @@ struct Stats {
 
 // MARK: - Formatting
 
-func reset(_ s: Int) -> String {
-    if s <= 0 { return "—" }
-    if s < 3600 { return "\(max(1, s / 60))m" }
-    if s < 86400 { let h = s / 3600, m = (s % 3600) / 60; return "\(h)h\(String(format: "%02d", m))" }
-    let d = s / 86400, h = (s % 86400) / 3600
+// Time left until a limit resets, e.g. "45m" / "3h07" / "2d4h".
+func formatCountdown(_ seconds: Int) -> String {
+    if seconds <= 0 { return "—" }
+    if seconds < 3600 { return "\(max(1, seconds / 60))m" }
+    if seconds < 86400 {
+        let h = seconds / 3600, m = (seconds % 3600) / 60
+        return "\(h)h\(String(format: "%02d", m))"
+    }
+    let d = seconds / 86400, h = (seconds % 86400) / 3600
     return h > 0 ? "\(d)d\(h)h" : "\(d)d"
 }
 
 // Relative age for the dropdown, e.g. "8s ago" / "3m ago" / "2.4h ago".
-func relAge(_ s: Int) -> String {
-    if s < 0 { return "never" }
-    if s < 5 { return "just now" }
-    if s < 60 { return "\(s)s ago" }
-    if s < 3600 { return "\(s / 60)m ago" }
-    if s < 86400 { return String(format: "%.1fh ago", Double(s) / 3600) }
-    return "\(s / 86400)d ago"
+func formatAge(_ seconds: Int) -> String {
+    if seconds < 0 { return "never" }
+    if seconds < 5 { return "just now" }
+    if seconds < 60 { return "\(seconds)s ago" }
+    if seconds < 3600 { return "\(seconds / 60)m ago" }
+    if seconds < 86400 { return String(format: "%.1fh ago", Double(seconds) / 3600) }
+    return "\(seconds / 86400)d ago"
 }
 
 // MARK: - Colour
@@ -139,160 +144,172 @@ func muted(_ c: NSColor) -> NSColor {
 // wins when a limit is actually hot — danger must never be traded for prettiness.
 let seriesColors: [NSColor] = [muted(.systemBlue), muted(.systemPurple), muted(.systemTeal)]
 
-// 0 normal, 1 warning, 2 critical — one rule shared by every renderer so the
-// glyph, the number and the dropdown can never disagree about "hot".
-func alertLevel(_ l: Limit) -> Int {
-    if l.severity == "critical" || l.pct >= 90 { return 2 }
-    if l.severity == "warning"  || l.pct >= 75 { return 1 }
-    return 0
+// One rule shared by every renderer, so the glyph, the number and the dropdown
+// can never disagree about "hot".
+enum AlertLevel: Int, Comparable {
+    case normal, warning, critical
+    static func < (a: AlertLevel, b: AlertLevel) -> Bool { a.rawValue < b.rawValue }
+}
+
+func alertLevel(_ l: Limit) -> AlertLevel {
+    if l.severity == "critical" || l.pct >= 90 { return .critical }
+    if l.severity == "warning"  || l.pct >= 75 { return .warning }
+    return .normal
 }
 
 func gaugeColor(_ l: Limit, _ series: Int = 0) -> NSColor {
     switch alertLevel(l) {
-    case 2: return muted(.systemRed)
-    case 1: return muted(.systemOrange)
-    default: return seriesColors[series % seriesColors.count]
+    case .critical: return muted(.systemRed)
+    case .warning: return muted(.systemOrange)
+    case .normal: return seriesColors[series % seriesColors.count]
     }
 }
 
 // MARK: - Usage history (for the graph in the dropdown)
 
-struct Point { var t: Double; var s: Double; var w: Double; var f: Double }
+struct HistoryPoint { var time: Double; var session: Double; var weekly: Double; var scoped: Double }
 
-func loadHistory() -> [Point] {
-    let p = cacheDir.appendingPathComponent("usage-history.csv")
-    guard let txt = try? String(contentsOf: p, encoding: .utf8) else { return [] }
-    var out: [Point] = []
-    for line in txt.split(separator: "\n") {
+// How many of the most recent points the graph draws.
+let historyPointsShown = 400
+
+func loadHistory() -> [HistoryPoint] {
+    let file = cacheDir.appendingPathComponent("usage-history.csv")
+    guard let text = try? String(contentsOf: file, encoding: .utf8) else { return [] }
+    var points: [HistoryPoint] = []
+    for line in text.split(separator: "\n") {
+        // time, identity label (not graphed), session %, weekly %, scoped %.
         let f = line.split(separator: ",", omittingEmptySubsequences: false)
-        guard f.count == 5, let t = Double(f[0]) else { continue }
-        out.append(Point(t: t, s: Double(f[2]) ?? 0, w: Double(f[3]) ?? 0, f: Double(f[4]) ?? 0))
+        guard f.count == 5, let time = Double(f[0]) else { continue }
+        points.append(HistoryPoint(time: time, session: Double(f[2]) ?? 0,
+                                   weekly: Double(f[3]) ?? 0, scoped: Double(f[4]) ?? 0))
     }
-    return out.suffix(400)
+    return points.suffix(historyPointsShown)
 }
 
-// MARK: - Bar drawing
+// MARK: - Gauge drawing
 
 // Match the real menu-bar height so drawn images fill it instead of being
 // scaled down (a notched MacBook is ~24pt, a classic bar ~22). Floor at 18 for
 // safety if the status bar reports something tiny.
-let H: CGFloat = max(18, NSStatusBar.system.thickness)
+let menuBarHeight: CGFloat = max(18, NSStatusBar.system.thickness)
 
-// The glyph: three stacked mini-bars, one per limit, colour-coded like the
-// dropdown so the two views share one visual language. `badge` paints a small
-// dot floating at the top-right — the meter's OWN health indicator (yellow =
-// data old, red = collector failing), deliberately separate from the limit
-// colours inside the bars so "the meter is sick" never masquerades as "a limit
-// is hot".
-func barsGlyph(_ limits: [Limit], badge: NSColor? = nil) -> NSImage {
-    let w: CGFloat = 16, bh: CGFloat = 2.6, gap: CGFloat = 2.2
-    let stackH = bh * 3 + gap * 2
-    let img = NSImage(size: NSSize(width: w, height: H))
-    img.lockFocus()
-    NSGraphicsContext.current?.shouldAntialias = true
-    let y0 = (H - stackH) / 2
-    for (i, l) in limits.enumerated() {
-        let y = y0 + CGFloat(limits.count - 1 - i) * (bh + gap)   // first limit on top
-        NSColor.quaternaryLabelColor.setFill()
-        NSBezierPath(roundedRect: NSRect(x: 0, y: y, width: w, height: bh),
-                     xRadius: bh / 2, yRadius: bh / 2).fill()
-        // At 16px a strict proportional fill makes 1-9% invisible, so floor a
-        // nonzero fill at one cap-width. The precise number is beside the glyph.
-        var fw = CGFloat(min(100, l.pct)) / 100 * w
-        if l.pct > 0 { fw = max(fw, bh) }
-        if fw > 0 {
-            let r = min(bh / 2, fw / 2)
-            gaugeColor(l, i).setFill()
-            NSBezierPath(roundedRect: NSRect(x: 0, y: y, width: fw, height: bh),
-                         xRadius: r, yRadius: r).fill()
-        }
-    }
-    if let bc = badge {
-        let d: CGFloat = 4.5
-        bc.setFill()
-        NSBezierPath(ovalIn: NSRect(x: w - d, y: min(H - d, y0 + stackH + 0.5), width: d, height: d)).fill()
-    }
-    img.unlockFocus()
-    img.isTemplate = false
-    return img
+// A rounded track with the limit's fill over it — the one shape the glyph and
+// the dropdown both draw, so the two views cannot drift apart.
+//
+// A nonzero fill is floored at one cap-width: a strict proportional fill makes
+// 1-9% invisible at these sizes, and the precise number is printed beside the
+// gauge anyway.
+func drawGauge(_ rect: NSRect, pct: Int, color: NSColor) {
+    let trackRadius = rect.height / 2
+    NSColor.quaternaryLabelColor.setFill()
+    NSBezierPath(roundedRect: rect, xRadius: trackRadius, yRadius: trackRadius).fill()
+
+    var fillWidth = CGFloat(min(100, pct)) / 100 * rect.width
+    if pct > 0 { fillWidth = max(fillWidth, rect.height) }
+    guard fillWidth > 0 else { return }
+    let fillRadius = min(trackRadius, fillWidth / 2)
+    color.setFill()
+    NSBezierPath(roundedRect: NSRect(x: rect.minX, y: rect.minY, width: fillWidth, height: rect.height),
+                 xRadius: fillRadius, yRadius: fillRadius).fill()
 }
 
-// MARK: - Dropdown graph
+// The menu-bar glyph: three stacked mini-bars, one per limit, colour-coded like
+// the dropdown so the two views share one visual language. `badge` paints a
+// small dot floating at the top-right — the meter's OWN health indicator
+// (yellow = data old, red = collector failing), deliberately separate from the
+// limit colours inside the bars so "the meter is sick" never masquerades as
+// "a limit is hot".
+func barsGlyph(_ limits: [Limit], badge: NSColor? = nil) -> NSImage {
+    let width: CGFloat = 16, barHeight: CGFloat = 2.6, gap: CGFloat = 2.2
+    let stackHeight = barHeight * 3 + gap * 2
+    let image = NSImage(size: NSSize(width: width, height: menuBarHeight))
+    image.lockFocus()
+    NSGraphicsContext.current?.shouldAntialias = true
+    let bottom = (menuBarHeight - stackHeight) / 2
+    for (i, limit) in limits.enumerated() {
+        let y = bottom + CGFloat(limits.count - 1 - i) * (barHeight + gap)   // first limit on top
+        drawGauge(NSRect(x: 0, y: y, width: width, height: barHeight),
+                  pct: limit.pct, color: gaugeColor(limit, i))
+    }
+    if let badge {
+        let size: CGFloat = 4.5
+        badge.setFill()
+        NSBezierPath(ovalIn: NSRect(x: width - size, y: min(menuBarHeight - size, bottom + stackHeight + 0.5),
+                                    width: size, height: size)).fill()
+    }
+    image.unlockFocus()
+    image.isTemplate = false
+    return image
+}
+
+// MARK: - Dropdown view
 
 // The click-through view: full-size colourful progress bars for the three
 // limits, and underneath a multi-series graph of how they have moved over time.
 // Drawn as a real NSView rather than menu text so it can use colour and shape —
 // the text rows could show the numbers but never the shape of the usage.
-final class UsageGraph: NSView {
+final class UsageView: NSView {
     var limits: [(String, Limit)] = []
-    var history: [Point] = []
+    var history: [HistoryPoint] = []
+
+    private let pad: CGFloat = 14
+    private let labelColumn: CGFloat = 60
+    private let graphHeight: CGFloat = 60
 
     override func draw(_ dirty: NSRect) {
-        let W = bounds.width, pad: CGFloat = 14
-        let innerW = W - pad * 2
         NSGraphicsContext.current?.shouldAntialias = true
+        let belowRows = drawLimitRows(top: bounds.height - 10)
+        let graphY = belowRows - 8 - graphHeight
+        guard graphY > 4 else { return }
+        drawHistory(in: NSRect(x: pad + labelColumn, y: graphY,
+                               width: bounds.width - pad * 2 - labelColumn, height: graphHeight))
+    }
 
-        // ── Progress bars ────────────────────────────────────────────────
-        // Sized to be read instantly: a 12pt track with a full-height rounded
-        // fill, 13pt percentages. The first cut used 7pt bars, whose fill at
-        // 20-30% was a barely-visible stub.
-        let rowH: CGFloat = 30, barH: CGFloat = 12
-        let labelW: CGFloat = 60, rightW: CGFloat = 104
-        let barW = innerW - labelW - rightW
-        var y = bounds.height - 10
+    // One row per limit: name, gauge, percentage, time to reset. Sized to be
+    // read instantly — a 12pt track with a full-height rounded fill and 13pt
+    // percentages. The first cut used 7pt bars, whose fill at 20-30% was a
+    // barely-visible stub. Returns the y the rows end at.
+    private func drawLimitRows(top: CGFloat) -> CGFloat {
+        let rowHeight: CGFloat = 30, barHeight: CGFloat = 12
+        let percentColumn: CGFloat = 104
+        let gaugeWidth = bounds.width - pad * 2 - labelColumn - percentColumn
+        var y = top
         for (i, item) in limits.enumerated() {
-            let (name, l) = item
-            y -= rowH
-            let yc = y + rowH / 2
-            func put(_ s: String, _ c: NSColor, _ x: CGFloat, _ sz: CGFloat = 11, _ w: NSFont.Weight = .regular, right: Bool = false) {
-                let a = NSAttributedString(string: s, attributes: [
-                    .font: NSFont.monospacedDigitSystemFont(ofSize: sz, weight: w), .foregroundColor: c])
-                a.draw(at: NSPoint(x: right ? x - a.size().width : x, y: yc - a.size().height / 2))
-            }
-            put(name, .secondaryLabelColor, pad, 12, .medium)
-            let bx = pad + labelW, by = yc - barH / 2
-            NSColor.quaternaryLabelColor.setFill()
-            NSBezierPath(roundedRect: NSRect(x: bx, y: by, width: barW, height: barH), xRadius: barH / 2, yRadius: barH / 2).fill()
-            // Floor a nonzero fill at one cap-width so low single digits stay
-            // visible; the number beside the bar carries the precise value.
-            var fw = CGFloat(min(100, l.pct)) / 100 * barW
-            if l.pct > 0 { fw = max(fw, barH) }
-            if fw > 0.5 {
-                let r = min(barH / 2, fw / 2)
-                gaugeColor(l, i).setFill()
-                NSBezierPath(roundedRect: NSRect(x: bx, y: by, width: fw, height: barH), xRadius: r, yRadius: r).fill()
-            }
-            put("\(l.pct)%", alertLevel(l) > 0 ? gaugeColor(l, i) : .labelColor, bx + barW + 44, 13, .semibold, right: true)
-            put(reset(l.reset), .secondaryLabelColor, W - pad, 11, .regular, right: true)
+            let (name, limit) = item
+            y -= rowHeight
+            let middle = y + rowHeight / 2
+            drawText(name, .secondaryLabelColor, x: pad, centredOn: middle, size: 12, weight: .medium)
+            drawGauge(NSRect(x: pad + labelColumn, y: middle - barHeight / 2,
+                             width: gaugeWidth, height: barHeight),
+                      pct: limit.pct, color: gaugeColor(limit, i))
+            drawText("\(limit.pct)%", alertLevel(limit) != .normal ? gaugeColor(limit, i) : .labelColor,
+                     x: pad + labelColumn + gaugeWidth + 44, centredOn: middle,
+                     size: 13, weight: .semibold, rightAligned: true)
+            drawText(formatCountdown(limit.resetIn), .secondaryLabelColor,
+                     x: bounds.width - pad, centredOn: middle, rightAligned: true)
         }
+        return y
+    }
 
-        // ── History graph ────────────────────────────────────────────────
-        y -= 8
-        let gh: CGFloat = 60
-        let gy = y - gh
-        guard gy > 4 else { return }
-        let frame = NSRect(x: pad + labelW, y: gy, width: innerW - labelW, height: gh)
-
+    private func drawHistory(in frame: NSRect) {
         // AUTO-SCALE the y axis. These limits sit in single digits most of the
         // time, and on a fixed 0-100 axis every series flatlines along the
         // bottom — technically honest, visually useless. Scale to the peak
         // instead and LABEL the top tick, so the axis still says exactly what it
         // means. Floor of 20 keeps a near-zero graph from magnifying noise.
-        let peak = history.reduce(0.0) { max($0, max($1.s, max($1.w, $1.f))) }
+        let peak = history.reduce(0.0) { max($0, max($1.session, max($1.weekly, $1.scoped))) }
         let yMax = min(100.0, max(20.0, (peak * 1.35 / 10).rounded(.up) * 10))
+
         NSColor.quaternaryLabelColor.setStroke()
-        for frac in [0.0, 0.5, 1.0] {
-            let gp = NSBezierPath()
-            gp.move(to: NSPoint(x: frame.minX, y: frame.minY + CGFloat(frac) * gh))
-            gp.line(to: NSPoint(x: frame.maxX, y: frame.minY + CGFloat(frac) * gh))
-            gp.lineWidth = 0.5; gp.stroke()
+        for fraction in [0.0, 0.5, 1.0] {
+            let gridline = NSBezierPath()
+            gridline.move(to: NSPoint(x: frame.minX, y: frame.minY + CGFloat(fraction) * frame.height))
+            gridline.line(to: NSPoint(x: frame.maxX, y: frame.minY + CGFloat(fraction) * frame.height))
+            gridline.lineWidth = 0.5
+            gridline.stroke()
         }
-        func tick(_ s: String, _ yy: CGFloat) {
-            let a = NSAttributedString(string: s, attributes: [
-                .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
-                .foregroundColor: NSColor.tertiaryLabelColor,
-            ])
-            a.draw(at: NSPoint(x: frame.minX - 6 - a.size().width, y: yy - 5))
+        func tick(_ text: String, _ y: CGFloat) {
+            drawCaption(text) { size in NSPoint(x: frame.minX - 6 - size.width, y: y - 5) }
         }
         tick("\(Int(yMax))%", frame.maxY); tick("0", frame.minY)
 
@@ -305,71 +322,94 @@ final class UsageGraph: NSView {
         // Time is the x axis. Points are irregular (only written when a value
         // changes or 10 min pass), so plot against real elapsed time, not index —
         // otherwise a long flat stretch looks like a fast climb.
-        let t0 = history.first!.t, t1 = max(history.last!.t, t0 + 1)
-        func line(_ pick: (Point) -> Double, _ color: NSColor) {
-            let p = NSBezierPath()
-            for (i, pt) in history.enumerated() {
-                let x = frame.minX + CGFloat((pt.t - t0) / (t1 - t0)) * frame.width
-                let yy = frame.minY + CGFloat(min(yMax, max(0, pick(pt))) / yMax) * gh
-                i == 0 ? p.move(to: NSPoint(x: x, y: yy)) : p.line(to: NSPoint(x: x, y: yy))
+        let start = history.first!.time, end = max(history.last!.time, start + 1)
+        func line(_ pick: (HistoryPoint) -> Double, _ color: NSColor) {
+            let path = NSBezierPath()
+            for (i, point) in history.enumerated() {
+                let x = frame.minX + CGFloat((point.time - start) / (end - start)) * frame.width
+                let y = frame.minY + CGFloat(min(yMax, max(0, pick(point))) / yMax) * frame.height
+                i == 0 ? path.move(to: NSPoint(x: x, y: y)) : path.line(to: NSPoint(x: x, y: y))
             }
-            p.lineWidth = 1.6; p.lineJoinStyle = .round; p.lineCapStyle = .round
-            color.setStroke(); p.stroke()
+            path.lineWidth = 1.6; path.lineJoinStyle = .round; path.lineCapStyle = .round
+            color.setStroke(); path.stroke()
         }
-        line({ $0.s }, seriesColors[0])
-        line({ $0.w }, seriesColors[1])
-        line({ $0.f }, seriesColors[2])
+        line({ $0.session }, seriesColors[0])
+        line({ $0.weekly }, seriesColors[1])
+        line({ $0.scoped }, seriesColors[2])
 
         // Span label, INSIDE the plot's top-right — drawn below the frame it was
         // clipped by the view's own bottom edge.
-        let span = Int(t1 - t0)
-        let spanTxt = span < 3600 ? "\(max(1, span / 60))m" : (span < 86400 ? "\(span / 3600)h" : "\(span / 86400)d")
-        let sa = NSAttributedString(string: "last \(spanTxt)", attributes: [
+        let span = Int(end - start)
+        let spanText = span < 3600 ? "\(max(1, span / 60))m"
+            : (span < 86400 ? "\(span / 3600)h" : "\(span / 86400)d")
+        drawCaption("last \(spanText)") { size in
+            NSPoint(x: frame.maxX - size.width - 2, y: frame.maxY - 10)
+        }
+    }
+
+    // A row label or number: left-aligned at x, or right-aligned to it,
+    // vertically centred on its row.
+    private func drawText(_ s: String, _ color: NSColor, x: CGFloat, centredOn y: CGFloat,
+                          size: CGFloat = 11, weight: NSFont.Weight = .regular,
+                          rightAligned: Bool = false) {
+        let text = NSAttributedString(string: s, attributes: [
+            .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight),
+            .foregroundColor: color,
+        ])
+        text.draw(at: NSPoint(x: rightAligned ? x - text.size().width : x,
+                              y: y - text.size().height / 2))
+    }
+
+    // The graph's small grey captions: the axis ticks and the span label, each
+    // placed from its own measured size.
+    private func drawCaption(_ s: String, at place: (NSSize) -> NSPoint) {
+        let text = NSAttributedString(string: s, attributes: [
             .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
             .foregroundColor: NSColor.tertiaryLabelColor,
         ])
-        sa.draw(at: NSPoint(x: frame.maxX - sa.size().width - 2, y: frame.maxY - 10))
+        text.draw(at: place(text.size()))
     }
 }
 
 // MARK: - App
 
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private var claudeItem: NSStatusItem!
-    private let claudeMenu = NSMenu()
-    private var timer: Timer?
+    private var statusItem: NSStatusItem!
+    private let statusMenu = NSMenu()
     private var stats = Stats()
     private var haveStats = false
-    private var statsScript = ""
+    private var collectorPath = ""
     private var lastError: String?
-    private var lastGood: Date?          // when the collector last returned parseable JSON
+    private var lastGoodCollection: Date?   // when the collector last returned parseable JSON
     private var failStreak = 0
     private var collecting = false
 
     // Where the collector may live, in order. The environment wins so a checkout
     // can be tested without installing, then the two usual bin directories.
-    private static var statsCandidates: [String] {
+    private static var collectorCandidates: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        var c: [String] = []
-        if let e = ProcessInfo.processInfo.environment["CLAUDE_METER_STATS"], !e.isEmpty { c.append(e) }
-        c.append("\(home)/.local/bin/claude-meter-stats")
-        c.append("/usr/local/bin/claude-meter-stats")
-        c.append("/opt/homebrew/bin/claude-meter-stats")
-        return c
+        var candidates: [String] = []
+        if let fromEnv = ProcessInfo.processInfo.environment["CLAUDE_METER_STATS"], !fromEnv.isEmpty {
+            candidates.append(fromEnv)
+        }
+        candidates.append("\(home)/.local/bin/claude-meter-stats")
+        candidates.append("/usr/local/bin/claude-meter-stats")
+        candidates.append("/opt/homebrew/bin/claude-meter-stats")
+        return candidates
     }
 
     // The meter's own health, distinct from the data's age. Three missed
     // 30s ticks means the collector itself is failing or wedged.
     private var collectorSick: Bool {
         if failStreak >= 3 { return true }
-        guard let g = lastGood else { return false }
-        return Date().timeIntervalSince(g) > 150
+        guard let last = lastGoodCollection else { return false }
+        return Date().timeIntervalSince(last) > 150
     }
     // Age of the DATA as of now: age at collection time plus time since then.
     private var dataAge: Int {
         guard haveStats, stats.ageS >= 0 else { return -1 }
-        let since = lastGood.map { Int(Date().timeIntervalSince($0)) } ?? 0
-        return stats.ageS + max(0, since)
+        let sinceCollection = lastGoodCollection.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        return stats.ageS + max(0, sinceCollection)
     }
     // 45 min covers the collector's worst normal cadence (900s idle TTL plus a
     // failed attempt's backoff); older than that means refresh is broken.
@@ -385,28 +425,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let others = NSRunningApplication.runningApplications(
             withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.ayushsharma.claude-meter")
             .filter { $0.processIdentifier != me }
-        for a in others { a.terminate() }
+        for other in others { other.terminate() }
 
-        for c in Self.statsCandidates where FileManager.default.isExecutableFile(atPath: c) {
-            statsScript = c
-            break
-        }
+        collectorPath = Self.collectorCandidates.first {
+            FileManager.default.isExecutableFile(atPath: $0)
+        } ?? ""
 
-        claudeMenu.delegate = self
-        claudeItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        claudeItem.menu = claudeMenu
-        if let b = claudeItem.button {
-            b.imagePosition = .imageLeading
-            b.attributedTitle = barText("…", .secondaryLabelColor)
+        statusMenu.delegate = self
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        statusItem.menu = statusMenu
+        if let button = statusItem.button {
+            button.imagePosition = .imageLeading
+            button.attributedTitle = barText("…", .secondaryLabelColor)
         }
         refresh()
 
         // .common mode, or the timer freezes exactly when someone is LOOKING at
         // the meter: menu tracking runs the run loop in event-tracking mode,
         // where a default-mode timer never fires.
-        let t = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        let timer = Timer(timeInterval: 30, repeats: true) { [weak self] _ in self?.refresh() }
+        RunLoop.main.add(timer, forMode: .common)
 
         // Refresh immediately at wake instead of painting pre-sleep numbers
         // for up to a full tick.
@@ -418,45 +456,61 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // MARK: Collect
 
     private func refresh() {
-        guard !statsScript.isEmpty else { lastError = "claude-meter-stats not found"; failStreak += 1; render(); return }
+        guard !collectorPath.isEmpty else {
+            lastError = "claude-meter-stats not found"
+            failStreak += 1
+            render()
+            return
+        }
         // One collection at a time: a wedged run must not pile new processes on
-        // top of itself every tick. Liveness is preserved by the watchdog below
-        // plus collectorSick surfacing the gap in the UI.
+        // top of itself every tick. Liveness is preserved by the watchdog in
+        // runCollector plus collectorSick surfacing the gap in the UI.
         guard !collecting else { return }
         collecting = true
-        let script = statsScript
+        let script = collectorPath
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash"); p.arguments = [script]
-            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = FileHandle.nullDevice
-            var parsed: Stats?; var err: String?
-            do {
-                try p.run()
-                // Watchdog. The script bounds its own slow path (curl 15s), so
-                // 25s only trips when something is genuinely wedged; killing it
-                // turns a silent freeze into a visible error state. The read
-                // below still returns because every child holding the pipe is
-                // itself time-bounded.
-                let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
-                DispatchQueue.global().asyncAfter(deadline: .now() + 25, execute: killer)
-                let d = pipe.fileHandleForReading.readDataToEndOfFile()
-                p.waitUntilExit()
-                killer.cancel()
-                parsed = Self.parse(d)
-                if parsed == nil { err = d.isEmpty ? "collector timed out" : "collector output unparseable" }
-            } catch { err = "collector failed to start" }
+            let (parsed, error) = Self.runCollector(script)
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.collecting = false
-                if let s = parsed {
-                    self.stats = s; self.haveStats = true
-                    self.lastError = nil; self.lastGood = Date(); self.failStreak = 0
+                if let parsed {
+                    self.stats = parsed; self.haveStats = true
+                    self.lastError = nil; self.lastGoodCollection = Date(); self.failStreak = 0
                 } else {
-                    self.lastError = err; self.failStreak += 1
+                    self.lastError = error; self.failStreak += 1
                 }
                 self.render()
             }
         }
+    }
+
+    // Runs the collector to completion and parses what it printed. Blocking:
+    // callers are on a background queue.
+    private static func runCollector(_ script: String) -> (Stats?, String?) {
+        let collector = Process()
+        collector.executableURL = URL(fileURLWithPath: "/bin/bash")
+        collector.arguments = [script]
+        let pipe = Pipe()
+        collector.standardOutput = pipe
+        collector.standardError = FileHandle.nullDevice
+        do {
+            try collector.run()
+        } catch {
+            return (nil, "collector failed to start")
+        }
+        // Watchdog. The script bounds its own slow path (curl 15s), so 25s only
+        // trips when something is genuinely wedged; killing it turns a silent
+        // freeze into a visible error state. The read below still returns
+        // because every child holding the pipe is itself time-bounded.
+        let killer = DispatchWorkItem { if collector.isRunning { collector.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 25, execute: killer)
+        let output = pipe.fileHandleForReading.readDataToEndOfFile()
+        collector.waitUntilExit()
+        killer.cancel()
+        guard let parsed = parse(output) else {
+            return (nil, output.isEmpty ? "collector timed out" : "collector output unparseable")
+        }
+        return (parsed, nil)
     }
 
     private static func parse(_ data: Data) -> Stats? {
@@ -470,13 +524,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             s.ageS = c["age_s"] as? Int ?? Int(((c["stale_hours"] as? Double) ?? -1) * 3600)
             s.fetchErr = c["fetch_err"] as? String ?? ""
             s.retryIn = c["retry_in"] as? Int ?? 0
-            if let sl = c["scoped_label"] as? String, !sl.isEmpty { s.scopedLabel = sl }
-            func lim(_ k: String) -> Limit {
-                guard let d = c[k] as? [String: Any] else { return Limit() }
-                return Limit(pct: d["pct"] as? Int ?? 0, reset: d["reset_in"] as? Int ?? 0,
+            if let label = c["scoped_label"] as? String, !label.isEmpty { s.scopedLabel = label }
+            func limit(_ key: String) -> Limit {
+                guard let d = c[key] as? [String: Any] else { return Limit() }
+                return Limit(pct: d["pct"] as? Int ?? 0, resetIn: d["reset_in"] as? Int ?? 0,
                              severity: d["severity"] as? String ?? "normal")
             }
-            s.session = lim("session"); s.weekly = lim("weekly"); s.scoped = lim("scoped")
+            s.session = limit("session"); s.weekly = limit("weekly"); s.scoped = limit("scoped")
         }
         return s
     }
@@ -491,38 +545,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func render() {
-        guard let b = claudeItem.button else { return }
-        let badge: NSColor? = collectorSick ? muted(.systemRed) : (dataStale ? muted(.systemYellow) : nil)
+        guard let button = statusItem.button else { return }
+        let badge = badgeColor()
         guard haveStats, stats.ok else {
-            b.image = barsGlyph([Limit(), Limit(), Limit()], badge: badge ?? (haveStats ? nil : muted(.systemYellow)))
-            b.attributedTitle = barText("—", .secondaryLabelColor)
+            // Before the first collection lands there is nothing to be sick
+            // about yet, but the dash still has to say it is not a reading.
+            button.image = barsGlyph([Limit(), Limit(), Limit()],
+                                     badge: badge ?? (haveStats ? nil : muted(.systemYellow)))
+            button.attributedTitle = barText("—", .secondaryLabelColor)
             return
         }
-        let limits = [stats.session, stats.weekly, stats.scoped]
-        b.image = barsGlyph(limits, badge: badge)
-        // The number is the SESSION % — the value that moves while working —
-        // unless another limit is hot, in which case the hot one takes over
-        // with its label so the number stays self-describing ("wk 92%"). The
-        // scoped limit brings the name the endpoint gave it, truncated because
-        // the menu bar is not elastic and a model name is not bounded.
+        button.image = barsGlyph([stats.session, stats.weekly, stats.scoped], badge: badge)
+        let (text, color) = statusTitle()
+        button.attributedTitle = barText(text, color)
+    }
+
+    // The meter's own health, never a limit — see barsGlyph.
+    private func badgeColor() -> NSColor? {
+        if collectorSick { return muted(.systemRed) }
+        return dataStale ? muted(.systemYellow) : nil
+    }
+
+    // The number beside the glyph is the SESSION % — the value that moves while
+    // working — unless another limit is hot, in which case the hot one takes
+    // over with its label so the number stays self-describing ("wk 92%"). The
+    // scoped limit brings the name the endpoint gave it, truncated because the
+    // menu bar is not elastic and a model name is not bounded.
+    private func statusTitle() -> (String, NSColor) {
         let named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly),
                                         (String(stats.scopedLabel.prefix(12)), stats.scoped)]
         let worst = named.enumerated().max {
             (alertLevel($0.element.1), $0.element.1.pct) < (alertLevel($1.element.1), $1.element.1.pct)
         }!
-        var text = "\(stats.session.pct)%"
-        var color: NSColor = dataStale || collectorSick ? .secondaryLabelColor : .labelColor
-        if alertLevel(worst.element.1) > 0 {
-            color = gaugeColor(worst.element.1, worst.offset)
-            if worst.offset != 0 { text = "\(worst.element.0) \(worst.element.1.pct)%" }
+        guard alertLevel(worst.element.1) != .normal else {
+            let dimmed = dataStale || collectorSick
+            return ("\(stats.session.pct)%", dimmed ? .secondaryLabelColor : .labelColor)
         }
-        b.attributedTitle = barText(text, color)
+        let text = worst.offset == 0 ? "\(stats.session.pct)%"
+                                     : "\(worst.element.0) \(worst.element.1.pct)%"
+        return (text, gaugeColor(worst.element.1, worst.offset))
     }
 
     // MARK: Menu (rebuilt at open, so ages are computed when eyes are on them)
 
     func menuNeedsUpdate(_ menu: NSMenu) {
-        if menu === claudeMenu { buildClaudeMenu(menu) }
+        if menu === statusMenu { rebuildMenu(menu) }
     }
 
     func menuWillOpen(_ menu: NSMenu) {
@@ -531,43 +598,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refresh()
     }
 
-    private func header(_ m: NSMenu, _ s: String) {
-        let x = NSMenuItem(title: s, action: nil, keyEquivalent: ""); x.isEnabled = false
-        x.attributedTitle = NSAttributedString(string: s, attributes: [
-            .font: NSFont.systemFont(ofSize: 12.5, weight: .semibold),
-            .foregroundColor: NSColor.labelColor,
-        ])
-        m.addItem(x)
+    private func rebuildMenu(_ menu: NSMenu) {
+        menu.removeAllItems()
+        addHeader(menu, stats.email.isEmpty ? "Claude usage"
+                                            : "\(stats.email) · \(stats.account)")
+        if haveStats, stats.ok {
+            addFreshnessRows(menu)
+            let usage = UsageView(frame: NSRect(x: 0, y: 0, width: 340, height: 176))
+            usage.limits = [("Session", stats.session), ("Week", stats.weekly),
+                            (stats.scopedLabel, stats.scoped)]
+            usage.history = loadHistory()
+            let item = NSMenuItem(); item.view = usage; menu.addItem(item)
+        } else if haveStats {
+            addNote(menu, "No usage data yet — sign in to Claude Code once")
+        } else {
+            addNote(menu, lastError ?? "Collecting…")
+        }
+        menu.addItem(.separator())
+        addAction(menu, "Refresh Now", #selector(doRefresh), key: "r")
+        menu.addItem(.separator())
+        addAction(menu, "Quit Claude Meter", #selector(quit), key: "q")
     }
 
-    private func note(_ m: NSMenu, _ s: String, color: NSColor = .secondaryLabelColor) {
-        let x = NSMenuItem(title: s, action: nil, keyEquivalent: ""); x.isEnabled = false
-        x.attributedTitle = NSAttributedString(string: s, attributes: [
-            .font: NSFont.systemFont(ofSize: 11.5),
-            .foregroundColor: color,
-        ])
-        m.addItem(x)
-    }
-
-    // Text-only action rows, like the system's own status menus. (SF Symbol
-    // images on these rows were tried and do not render in this status-menu
-    // context; the custom-drawn glyph carries the iconography instead.)
-    private func action(_ m: NSMenu, _ title: String, _ sel: Selector, key: String = "") {
-        let x = NSMenuItem(title: title, action: sel, keyEquivalent: key)
-        x.target = self
-        m.addItem(x)
-    }
-
-    private func freshnessLine(_ m: NSMenu) {
-        let upd = lastGood.map { relAge(Int(Date().timeIntervalSince($0))) } ?? "never"
+    private func addFreshnessRows(_ menu: NSMenu) {
         // Say where the numbers CAME FROM and how old they are — the age of the
         // data, not of the last poll, is what decides whether to trust them.
         if stats.source == "api" && !dataStale {
-            note(m, "Usage API · fetched \(relAge(dataAge))")
+            addNote(menu, "Usage API · fetched \(formatAge(dataAge))")
         } else {
-            let age = relAge(dataAge).replacingOccurrences(of: " ago", with: "")
-            note(m, "Data \(age) old · from \(stats.source == "api" ? "usage API" : "claude's session cache")",
-                 color: dataStale ? .systemOrange : .secondaryLabelColor)
+            let age = formatAge(dataAge).replacingOccurrences(of: " ago", with: "")
+            addNote(menu, "Data \(age) old · from \(stats.source == "api" ? "usage API" : "claude's session cache")",
+                    color: dataStale ? .systemOrange : .secondaryLabelColor)
         }
         // A down live path is stated with its reason and retry time — a silent
         // fallback is indistinguishable from freshness, which is the one lie a
@@ -575,32 +636,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // not need claude, and the hint was wrong exactly when it showed.
         if !stats.fetchErr.isEmpty {
             let retry = stats.retryIn > 0 ? " · retry in \(max(1, stats.retryIn / 60))m" : ""
-            note(m, "Live fetch \(stats.fetchErr)\(retry)", color: .systemOrange)
+            addNote(menu, "Live fetch \(stats.fetchErr)\(retry)", color: .systemOrange)
         }
         if collectorSick {
-            note(m, "Meter not refreshing — \(lastError ?? "collector silent") · last success \(upd)", color: .systemRed)
+            let lastSuccess = lastGoodCollection.map { formatAge(Int(Date().timeIntervalSince($0))) } ?? "never"
+            addNote(menu, "Meter not refreshing — \(lastError ?? "collector silent") · last success \(lastSuccess)",
+                    color: .systemRed)
         }
     }
 
-    private func buildClaudeMenu(_ m: NSMenu) {
-        m.removeAllItems()
-        header(m, stats.email.isEmpty ? "Claude usage"
-                                      : "\(stats.email) · \(stats.account)")
-        if haveStats, stats.ok {
-            freshnessLine(m)
-            let g = UsageGraph(frame: NSRect(x: 0, y: 0, width: 340, height: 176))
-            g.limits = [("Session", stats.session), ("Week", stats.weekly), (stats.scopedLabel, stats.scoped)]
-            g.history = loadHistory()
-            let gi = NSMenuItem(); gi.view = g; m.addItem(gi)
-        } else if haveStats {
-            note(m, "No usage data yet — sign in to Claude Code once")
-        } else {
-            note(m, lastError ?? "Collecting…")
-        }
-        m.addItem(.separator())
-        action(m, "Refresh Now", #selector(doRefresh), key: "r")
-        m.addItem(.separator())
-        action(m, "Quit Claude Meter", #selector(quit), key: "q")
+    // Rows the app only prints. They carry their own attributed title because a
+    // disabled item's plain title would be greyed out by AppKit.
+    private func addTextRow(_ menu: NSMenu, _ text: String, font: NSFont, color: NSColor) {
+        let item = NSMenuItem(title: text, action: nil, keyEquivalent: "")
+        item.isEnabled = false
+        item.attributedTitle = NSAttributedString(string: text, attributes: [
+            .font: font, .foregroundColor: color,
+        ])
+        menu.addItem(item)
+    }
+
+    private func addHeader(_ menu: NSMenu, _ text: String) {
+        addTextRow(menu, text, font: .systemFont(ofSize: 12.5, weight: .semibold), color: .labelColor)
+    }
+
+    private func addNote(_ menu: NSMenu, _ text: String, color: NSColor = .secondaryLabelColor) {
+        addTextRow(menu, text, font: .systemFont(ofSize: 11.5), color: color)
+    }
+
+    // Text-only action rows, like the system's own status menus. (SF Symbol
+    // images on these rows were tried and do not render in this status-menu
+    // context; the custom-drawn glyph carries the iconography instead.)
+    private func addAction(_ menu: NSMenu, _ title: String, _ selector: Selector, key: String = "") {
+        let item = NSMenuItem(title: title, action: selector, keyEquivalent: key)
+        item.target = self
+        menu.addItem(item)
     }
 
     @objc private func doRefresh() { refresh() }
