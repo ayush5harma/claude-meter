@@ -33,7 +33,9 @@ APP_DIR="$HOME/Applications" bash install.sh
 ```
 
 Everything else it writes is yours: `~/.local/bin`, `~/Library/LaunchAgents`
-and `~/.cache/claude-meter`.
+and `~/.cache/claude-meter`. It says so if `~/.local/bin` is not on your PATH,
+which matters only for running the collector by hand. `bash install.sh --force`
+rebuilds even when nothing has changed.
 
 To remove it:
 
@@ -67,16 +69,19 @@ beside it.
   turns orange; at 90% or `critical`, red.
 - A **dot at the top-right of the glyph** is the meter's own health, never a
   limit: yellow means the data being shown is more than 45 minutes old (or that
-  nothing has been collected yet), red means the collector itself is failing. A
-  greyed-out number says the same thing as a yellow dot.
+  nothing has been collected yet), red means the collector itself is failing —
+  three polls in a row, or 150 seconds, without a usable answer. A greyed-out
+  number says the same as either dot.
 
 **In the dropdown:** the account email and which identity it belongs to; one
 line saying where the numbers came from and how old they are; a full-width gauge
 per limit with its exact percentage and time to reset; and a graph of how the
 three limits have moved over the recorded history, auto-scaled to the peak with
 the top tick labelled (on a fixed 0-100 axis these limits flatline along the
-bottom most of the time — honest, and useless). `Refresh Now` (⌘R) collects
-immediately. `Quit Claude Meter` (⌘Q) exits the app, but the launchd agent keeps
+bottom most of the time — honest, and useless). The percentages are the ones
+last collected, with their age worked out as you look; opening the menu also
+starts a collection, so the bar, and the next look, are fresh. `Refresh Now`
+(⌘R) collects immediately. `Quit Claude Meter` (⌘Q) exits the app, but the launchd agent keeps
 it alive and starts it again a moment later; to stop it for longer, unload the
 agent (`launchctl bootout gui/$(id -u)/com.ayushsharma.claude-meter`) or
 uninstall.
@@ -198,7 +203,8 @@ the network every time.
   is not a credential, but it holds the account's email and the full usage
   response, and no other account on the Mac needs either.
 - A history point is appended only when a value changes or 10 minutes pass, and
-  the file is capped at 2000 rows — a few tens of KB.
+  the file is capped at 2000 rows — a few tens of KB. The graph draws the most
+  recent 400 of them.
 
 The app runs the collector with a 25 s watchdog. The collector bounds its own
 slow path (`curl --max-time 15`), so the watchdog only trips when something is
@@ -262,8 +268,8 @@ The app reads `root["claude"]` and, inside it:
 | `age_s` | int | Seconds since the shown numbers left the API. |
 | `stale_hours` | float | The same age in hours; read only if `age_s` is absent. |
 | `fetch_err` | string | Why the live path is down: `rate-limited`, `no valid token`, `bad response`, `network error`. Absent when it is up. |
-| `retry_in` | int | Seconds until the collector will try the endpoint again. |
-| `session`, `weekly`, `scoped` | object | One per limit: `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity` (`normal` / `warning` / `critical`). |
+| `retry_in` | int | Seconds until the collector will try the endpoint again. Present only alongside `fetch_err`. |
+| `session`, `weekly`, `scoped` | object | One per limit: `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity` (`normal` / `warning` / `critical`). A reading in the older flat shape, without `limits[]`, has no per-model cap, so `scoped` is then absent. |
 | `scoped_label` | string | What the `scoped` cap applies to, for the UI to print. |
 
 `scoped` is the weekly cap that applies to one model family rather than to
@@ -289,8 +295,9 @@ then `/opt/homebrew/bin/claude-meter-stats` — first executable wins.
 `RunAtLoad` and `KeepAlive` true, `ProcessType` `Interactive` (a person is
 looking at it; it must not be throttled into the background band),
 `StandardOutPath` `/dev/null`, `StandardErrorPath` the log. `ProgramArguments`
-waits for the binary to exist before `exec`ing it, so an agent bootstrapped
-before the app is built sleeps instead of crash-looping.
+waits for the binary to exist, looking every five minutes, before `exec`ing it,
+so an agent bootstrapped before the app is built sleeps instead of
+crash-looping.
 
 ### Bundle identifier and launchd label
 
