@@ -35,9 +35,10 @@ FORCE=0
 say() { printf '  %s\n' "$*"; }
 
 # The header comment above IS the help text: printing it from the file keeps the
-# two from drifting, and stopping at the first line that is not a comment means
-# an edit to the header cannot silently truncate it, the way a hardcoded line
-# range once did.
+# two from drifting, where a hardcoded line range went stale the moment anyone
+# edited the header. It stops at the first line that is not a comment, so the
+# header has to stay one unbroken block of `#` lines -- a blank line in the
+# middle of it would cut the help short.
 usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
 
 while [ "$#" -gt 0 ]; do

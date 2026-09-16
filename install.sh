@@ -36,9 +36,10 @@ DOMAIN="gui/$(id -u)"
 say() { printf '  %s\n' "$*"; }
 
 # The header comment above IS the help text: printing it from the file keeps the
-# two from drifting, and stopping at the first line that is not a comment means
-# an edit to the header cannot silently truncate it, the way a hardcoded line
-# range once did.
+# two from drifting, where a hardcoded line range went stale the moment anyone
+# edited the header. It stops at the first line that is not a comment, so the
+# header has to stay one unbroken block of `#` lines -- a blank line in the
+# middle of it would cut the help short.
 usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
 
 MODE=install
@@ -65,10 +66,17 @@ unload_agent() {
 
 # The cache holds the API answer, the backoff stamp and the usage history, so it
 # goes only when asked for. CLAUDE_METER_CACHE_DIR is an environment variable,
-# which means it can arrive empty, relative, or as something no uninstaller
-# should ever recurse into: this refuses anything that is not an absolute path
-# at least two levels deep AND holding at least one of this app's own files --
-# `rm -rf` does not get the benefit of the doubt.
+# which means it can arrive relative, or as something no uninstaller should ever
+# recurse into: this refuses anything that is not an absolute path at least two
+# levels deep AND holding at least one of this app's own files -- `rm -rf` does
+# not get the benefit of the doubt.
+#
+# The empty case never reaches here, and that is worth knowing rather than
+# assuming: CACHE_DIR is set with `${CLAUDE_METER_CACHE_DIR:-...}`, so
+# `CLAUDE_METER_CACHE_DIR= bash install.sh --uninstall --purge` falls back to the
+# real default and deletes ~/.cache/claude-meter (measured 2026-09-16, on a real
+# cache). Dropping the colon would send an explicit empty value to the -z test
+# below instead; that is a behaviour change, so it is not made here.
 purge_cache() {
   # The trailing newline matters: awk reads no line at all from an empty string,
   # prints nothing, and the numeric test below would then error out rather than

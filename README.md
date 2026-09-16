@@ -166,7 +166,9 @@ A bare path keeps the directory-derived name: `~/.claude` is `default`,
 when the part before the first `=` is a bare name with no `/` in it, so a
 directory whose own name contains an `=` is still read as a path. Set the
 variable in whatever launches the meter — for the launchd agent, add an
-`EnvironmentVariables` dict to the plist.
+`EnvironmentVariables` dict to the plist. `install.sh` re-renders that plist from
+the template on every run, so re-apply the dict afterwards, or let whatever else
+manages the agent own the file.
 
 **The keychain item** is derived, not searched: Claude Code keys its credentials
 to the config directory, using the bare service name `Claude Code-credentials`
