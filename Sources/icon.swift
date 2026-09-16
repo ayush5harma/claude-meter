@@ -30,7 +30,7 @@ import AppKit
 // rather than a live call because a headless render has no window and so no
 // appearance to resolve a dynamic system colour against — the values would
 // depend on whatever appearance the build happened to inherit.
-let series: [NSColor] = [
+let seriesColors: [NSColor] = [
     NSColor(srgbRed: 0.3114, green: 0.5741, blue: 0.8711, alpha: 1),   // muted systemBlue
     NSColor(srgbRed: 0.7418, green: 0.3340, blue: 0.7928, alpha: 1),   // muted systemPurple
     NSColor(srgbRed: 0.3313, green: 0.7195, blue: 0.7528, alpha: 1),   // muted systemTeal
@@ -70,36 +70,35 @@ func lifted(_ c: NSColor, _ f: CGFloat) -> NSColor {
 // no public API for one. A superellipse |x|^n + |y|^n = 1 at n = 5 tracks it
 // closely enough that the difference is invisible below 512 pt, and it costs a
 // loop instead of a dependency.
-func squircle(in r: NSRect, n: CGFloat = 5) -> NSBezierPath {
-    let p = NSBezierPath()
-    let a = r.width / 2, b = r.height / 2
-    let cx = r.midX, cy = r.midY
+func squircle(in rect: NSRect, n: CGFloat = 5) -> NSBezierPath {
+    let path = NSBezierPath()
+    let a = rect.width / 2, b = rect.height / 2
     let steps = 720
     for i in 0...steps {
         let t = CGFloat(i) / CGFloat(steps) * 2 * .pi
         let ct = cos(t), st = sin(t)
-        let x = cx + a * copysign(pow(abs(ct), 2 / n), ct)
-        let y = cy + b * copysign(pow(abs(st), 2 / n), st)
-        if i == 0 { p.move(to: NSPoint(x: x, y: y)) } else { p.line(to: NSPoint(x: x, y: y)) }
+        let x = rect.midX + a * copysign(pow(abs(ct), 2 / n), ct)
+        let y = rect.midY + b * copysign(pow(abs(st), 2 / n), st)
+        if i == 0 { path.move(to: NSPoint(x: x, y: y)) } else { path.line(to: NSPoint(x: x, y: y)) }
     }
-    p.close()
-    return p
+    path.close()
+    return path
 }
 
-func render(_ px: Int, _ body: (CGFloat) -> Void) -> Data {
-    guard let rep = NSBitmapImageRep(
-        bitmapDataPlanes: nil, pixelsWide: px, pixelsHigh: px,
+func renderPNG(_ pixels: Int, _ draw: (CGFloat) -> Void) -> Data {
+    guard let bitmap = NSBitmapImageRep(
+        bitmapDataPlanes: nil, pixelsWide: pixels, pixelsHigh: pixels,
         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
         colorSpaceName: .calibratedRGB, bytesPerRow: 0, bitsPerPixel: 0)
-    else { fatalError("cannot allocate a \(px)x\(px) bitmap") }
-    rep.size = NSSize(width: px, height: px)
+    else { fatalError("cannot allocate a \(pixels)x\(pixels) bitmap") }
+    bitmap.size = NSSize(width: pixels, height: pixels)
     NSGraphicsContext.saveGraphicsState()
-    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+    NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: bitmap)
     NSGraphicsContext.current?.shouldAntialias = true
-    body(CGFloat(px))
+    draw(CGFloat(pixels))
     NSGraphicsContext.restoreGraphicsState()
-    guard let png = rep.representation(using: .png, properties: [:]) else {
-        fatalError("cannot encode a \(px)x\(px) PNG")
+    guard let png = bitmap.representation(using: .png, properties: [:]) else {
+        fatalError("cannot encode a \(pixels)x\(pixels) PNG")
     }
     return png
 }
@@ -107,27 +106,29 @@ func render(_ px: Int, _ body: (CGFloat) -> Void) -> Data {
 // MARK: - The glyph
 
 // One stroked arc segment of the dial, in degrees, drawn clockwise from `from`.
-func arc(_ c: NSPoint, _ r: CGFloat, _ from: CGFloat, _ sweep: CGFloat,
-         _ w: CGFloat, _ color: NSColor) {
-    let p = NSBezierPath()
-    p.appendArc(withCenter: c, radius: r, startAngle: from, endAngle: from - sweep, clockwise: true)
-    p.lineWidth = w
-    p.lineCapStyle = .round
+func arc(center: NSPoint, radius: CGFloat, from: CGFloat, sweep: CGFloat,
+         width: CGFloat, color: NSColor) {
+    let path = NSBezierPath()
+    path.appendArc(withCenter: center, radius: radius,
+                   startAngle: from, endAngle: from - sweep, clockwise: true)
+    path.lineWidth = width
+    path.lineCapStyle = .round
     color.setStroke()
-    p.stroke()
+    path.stroke()
 }
 
-// The dial, drawn into a `s` x `s` canvas. Every measurement is a fraction of
-// the canvas so the same code renders the 1024 pt layer and a 16 pt tile.
-func drawGlyph(_ s: CGFloat, _ ap: Appearance) {
-    let c = NSPoint(x: s / 2, y: s * 0.485)   // nudged down: the open gap is at the bottom
-    let r = s * 0.312
-    let w = s * 0.116
+// The dial, drawn into a square canvas. Every measurement is a fraction of the
+// canvas, so the same code renders the 1024 pt layer and a 16 pt tile.
+func drawGlyph(_ size: CGFloat, _ appearance: Appearance) {
+    let center = NSPoint(x: size / 2, y: size * 0.485)   // nudged down: the open gap is at the bottom
+    let radius = size * 0.312
+    let strokeWidth = size * 0.116
 
     // A 270-degree sweep open at the bottom is what makes this read as a gauge
     // rather than a generic ring, and the gap survives being 4 px wide.
     let start: CGFloat = 225, span: CGFloat = 270
-    arc(c, r, start, span, w, ap.track)
+    arc(center: center, radius: radius, from: start, sweep: span,
+        width: strokeWidth, color: appearance.track)
 
     // Three consecutive value segments, one per limit, in series order. The
     // fractions are illustrative, not live data — an app icon is a portrait of
@@ -135,51 +136,52 @@ func drawGlyph(_ s: CGFloat, _ ap: Appearance) {
     let fractions: [CGFloat] = [0.40, 0.24, 0.14]
     let gap: CGFloat = 5
     var angle = start
-    for (i, f) in fractions.enumerated() {
-        let sweep = span * f
-        arc(c, r, angle, sweep, w, lifted(series[i], ap.lift))
+    for (i, fraction) in fractions.enumerated() {
+        let sweep = span * fraction
+        arc(center: center, radius: radius, from: angle, sweep: sweep,
+            width: strokeWidth, color: lifted(seriesColors[i], appearance.lift))
         angle -= sweep + gap
     }
 }
 
-func drawTile(_ s: CGFloat, _ ap: Appearance) {
-    let inset = s * 0.008
-    let path = squircle(in: NSRect(x: inset, y: inset, width: s - 2 * inset, height: s - 2 * inset))
-    let g = NSGradient(starting: ap.tileTop, ending: ap.tileBottom)
-    g?.draw(in: path, angle: -90)
-    drawGlyph(s, ap)
+func drawTile(_ size: CGFloat, _ appearance: Appearance) {
+    let inset = size * 0.008
+    let tile = squircle(in: NSRect(x: inset, y: inset,
+                                   width: size - 2 * inset, height: size - 2 * inset))
+    NSGradient(starting: appearance.tileTop, ending: appearance.tileBottom)?.draw(in: tile, angle: -90)
+    drawGlyph(size, appearance)
 }
 
 // MARK: - Output
 
-let out = CommandLine.arguments.count > 1
+let outputDir = CommandLine.arguments.count > 1
     ? URL(fileURLWithPath: CommandLine.arguments[1])
     : { FileHandle.standardError.write(Data("usage: icon <output-dir>\n".utf8)); exit(2) }()
 
-let fm = FileManager.default
-let iconPkg = out.appendingPathComponent("AppIcon.icon")
-let assets = iconPkg.appendingPathComponent("Assets")
-let iconset = out.appendingPathComponent("AppIcon.iconset")
-for d in [assets, iconset] {
-    try? fm.removeItem(at: d)
-    try! fm.createDirectory(at: d, withIntermediateDirectories: true)
+let files = FileManager.default
+let iconPackage = outputDir.appendingPathComponent("AppIcon.icon")
+let assets = iconPackage.appendingPathComponent("Assets")
+let iconset = outputDir.appendingPathComponent("AppIcon.iconset")
+for dir in [assets, iconset] {
+    try? files.removeItem(at: dir)
+    try! files.createDirectory(at: dir, withIntermediateDirectories: true)
 }
 
 // The Icon Composer layers: the tile is the package's `fill`, so the layer PNG
 // carries only the glyph on transparency and the system masks, shadows and
 // glazes it. One PNG per appearance, swapped by `image-name-specializations`.
-for ap in [light, dark] {
-    let png = render(1024) { s in drawGlyph(s, ap) }
-    try! png.write(to: assets.appendingPathComponent("glyph-\(ap.name).png"))
+for appearance in [light, dark] {
+    let png = renderPNG(1024) { size in drawGlyph(size, appearance) }
+    try! png.write(to: assets.appendingPathComponent("glyph-\(appearance.name).png"))
 }
 
-func fill(_ ap: Appearance) -> String {
-    func c(_ x: NSColor) -> String {
-        let s = x.usingColorSpace(.sRGB)!
+func tileGradientJSON(_ appearance: Appearance) -> String {
+    func srgb(_ color: NSColor) -> String {
+        let c = color.usingColorSpace(.sRGB)!
         return String(format: "srgb:%.5f,%.5f,%.5f,%.5f",
-                      s.redComponent, s.greenComponent, s.blueComponent, s.alphaComponent)
+                      c.redComponent, c.greenComponent, c.blueComponent, c.alphaComponent)
     }
-    return "{ \"linear-gradient\" : [ \"\(c(ap.tileTop))\", \"\(c(ap.tileBottom))\" ] }"
+    return "{ \"linear-gradient\" : [ \"\(srgb(appearance.tileTop))\", \"\(srgb(appearance.tileBottom))\" ] }"
 }
 
 // Hand-written rather than JSONSerialization so the file reads like the ones
@@ -193,8 +195,8 @@ func fill(_ ap: Appearance) -> String {
 let json = """
 {
   "fill-specializations" : [
-    { "value" : \(fill(light)) },
-    { "appearance" : "dark", "value" : \(fill(dark)) }
+    { "value" : \(tileGradientJSON(light)) },
+    { "appearance" : "dark", "value" : \(tileGradientJSON(dark)) }
   ],
   "groups" : [
     {
@@ -215,15 +217,14 @@ let json = """
 }
 
 """
-try! Data(json.utf8).write(to: iconPkg.appendingPathComponent("icon.json"))
+try! Data(json.utf8).write(to: iconPackage.appendingPathComponent("icon.json"))
 
 // The legacy set. Each tile is drawn at its own pixel size rather than
 // downsampled from 1024, so the 16 pt one keeps its stroke instead of blurring.
-for base in [16, 32, 128, 256, 512] {
+for points in [16, 32, 128, 256, 512] {
     for scale in [1, 2] {
-        let px = base * scale
-        let name = scale == 1 ? "icon_\(base)x\(base).png" : "icon_\(base)x\(base)@2x.png"
-        let png = render(px) { s in drawTile(s, light) }
+        let name = scale == 1 ? "icon_\(points)x\(points).png" : "icon_\(points)x\(points)@2x.png"
+        let png = renderPNG(points * scale) { size in drawTile(size, light) }
         try! png.write(to: iconset.appendingPathComponent(name))
     }
 }
