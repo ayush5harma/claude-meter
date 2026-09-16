@@ -48,7 +48,9 @@ The cache (the API answer, the backoff stamp and the usage history) is kept
 unless you pass `--purge`, and `--purge` refuses to delete anything that is not
 an absolute path at least two levels deep holding at least one of this app's own
 files — `CLAUDE_METER_CACHE_DIR` is an environment variable, and `rm -rf` does
-not get the benefit of the doubt.
+not get the benefit of the doubt. The one gap: an explicitly EMPTY
+`CLAUDE_METER_CACHE_DIR` falls back to the default directory and is purged, so
+unset the variable rather than emptying it.
 
 Built and used on macOS 26 and 27. The sources use no API newer than macOS 14
 and the bundle declares `LSMinimumSystemVersion` 14.0, but nothing older than 26

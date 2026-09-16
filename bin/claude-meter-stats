@@ -68,7 +68,6 @@ from collections import namedtuple
 
 HOME = pathlib.Path.home()
 DEFAULT_CONFIG_DIR = HOME / ".claude"
-NOW = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
 CACHE_DIR = pathlib.Path(os.environ.get("CLAUDE_METER_CACHE_DIR") or (HOME / ".cache" / "claude-meter"))
 API_CACHE = CACHE_DIR / "usage-api.json"
@@ -268,6 +267,9 @@ def claude_is_running():
 
 API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or \
     (TTL_WHILE_CLAUDE_RUNS if claude_is_running() else TTL_WHILE_IDLE)
+# Sampled here, after the running-session check above, as it always was: every
+# time-derived field (age_s, reset_in, fetched_at, the history row) moves with it.
+NOW = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
 
 def keychain_service(config_dir):
