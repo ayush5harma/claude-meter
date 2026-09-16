@@ -32,12 +32,21 @@ OUT_DIR="${APP_DIR:-$DEFAULT_OUT}"
 AGENT_LABEL="${AGENT_LABEL:-com.ayushsharma.claude-meter}"
 FORCE=0
 
+say() { printf '  %s\n' "$*"; }
+
+# The header comment above IS the help text: printing it from the file keeps the
+# two from drifting, where a hardcoded line range went stale the moment anyone
+# edited the header. It stops at the first line that is not a comment, so the
+# header has to stay one unbroken block of `#` lines -- a blank line in the
+# middle of it would cut the help short.
+usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --force) FORCE=1 ;;
     --out) shift; OUT_DIR="${1:-$DEFAULT_OUT}" ;;
     --out=*) OUT_DIR="${1#--out=}" ;;
-    -h|--help) sed -n '2,23p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) printf 'build.sh: unknown argument %s\n' "$1" >&2; exit 64 ;;
   esac
   shift
@@ -45,8 +54,6 @@ done
 
 BUNDLE="$OUT_DIR/${APP_NAME}.app"
 BIN="$BUNDLE/Contents/MacOS/ClaudeMeter"
-
-say() { printf '  %s\n' "$*"; }
 
 # A path is not a compiler: /usr/bin/swiftc is a shim that exists on every Mac
 # and fails until the Xcode Command Line Tools are installed, so the guard must
@@ -57,16 +64,68 @@ SWIFTC="$(command -v swiftc 2>/dev/null || xcrun --find swiftc 2>/dev/null)"
 [ -n "$SWIFTC" ] && "$SWIFTC" --version >/dev/null 2>&1 \
   || { say "swiftc not usable — install the Xcode Command Line Tools (xcode-select --install)"; exit 0; }
 
-# Skip when nothing in Sources/ and no change to this script is newer than the
-# built binary. EVERY file counts, not just main.swift: a guard that watched
-# that one alone let an edit to icon.swift compile locally and never reach the
-# installed bundle (2026-09-07). Dot-files are excluded because this script
-# writes .build.log itself and Finder writes .DS_Store. A bundle with no icon
-# also rebuilds, so a run that failed midway through the artwork retries.
-if [ "$FORCE" -eq 0 ] && [ -x "$BIN" ] \
-   && [ -f "$BUNDLE/Contents/Resources/AppIcon.icns" ] \
-   && [ -z "$(find "$SOURCES" -type f ! -name '.*' -newer "$BIN" -print -quit)" ] \
-   && [ ! "${BASH_SOURCE[0]}" -nt "$BIN" ]; then
+# Nothing in Sources/ and no change to this script is newer than the built
+# binary. EVERY file counts, not just main.swift: a guard that watched that one
+# alone let an edit to icon.swift compile locally and never reach the installed
+# bundle (2026-09-07). Dot-files are excluded because this script writes
+# .build.log itself and Finder writes .DS_Store. A bundle with no icon is NOT up
+# to date, so a run that failed midway through the artwork retries.
+is_up_to_date() {
+  [ "$FORCE" -eq 0 ] && [ -x "$BIN" ] \
+    && [ -f "$BUNDLE/Contents/Resources/AppIcon.icns" ] \
+    && [ -z "$(find "$SOURCES" -type f ! -name '.*' -newer "$BIN" -print -quit)" ] \
+    && [ ! "${BASH_SOURCE[0]}" -nt "$BIN" ]
+}
+
+# CFBundleIdentifier is load-bearing and deliberately stable: macOS keys every
+# TCC privacy grant (and the single-instance sweep in main.swift) to it, so
+# changing it makes the system forget every permission this app was given.
+# Change it BEFORE the first build if you want your own, never after.
+write_info_plist() {
+  cat >"$BUNDLE/Contents/Info.plist" <<'PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key><string>Claude Meter</string>
+  <key>CFBundleDisplayName</key><string>Claude Meter</string>
+  <key>CFBundleIdentifier</key><string>local.ayushsharma.claude-meter</string>
+  <key>CFBundleExecutable</key><string>ClaudeMeter</string>
+  <!-- CFBundleIconFile is the pre-macOS-26 path (Resources/AppIcon.icns).
+       CFBundleIconName, which points at the appearance-aware icon inside
+       Assets.car, is added by build_icon only when actool produced one. -->
+  <key>CFBundleIconFile</key><string>AppIcon</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleShortVersionString</key><string>1.0</string>
+  <key>LSMinimumSystemVersion</key><string>14.0</string>
+  <key>NSHighResolutionCapable</key><true/>
+  <!-- Menu-bar only: no Dock tile, no app menu. Matches setActivationPolicy(.accessory). -->
+  <key>LSUIElement</key><true/>
+</dict>
+</plist>
+PLIST
+}
+
+# Compile beside the target and rename into place: swiftc -o straight onto the
+# installed path truncates the inode a RUNNING meter has mapped, which can
+# SIGBUS it mid-draw. A same-volume rename gives the new build a fresh inode
+# and the old process keeps its pages until it exits.
+compile_app() {
+  say "compiling"
+  if ! "$SWIFTC" -O -whole-module-optimization \
+        -framework AppKit \
+        -o "$BIN.new" "$SOURCES/main.swift" 2>"$SRC_DIR/.build.log"; then
+    say "BUILD FAILED — see $SRC_DIR/.build.log"
+    tail -15 "$SRC_DIR/.build.log" | sed 's/^/      /'
+    rm -f "$BIN.new"
+    exit 1
+  fi
+  chmod +x "$BIN.new"
+  mv -f "$BIN.new" "$BIN"
+  rm -f "$SRC_DIR/.build.log"
+}
+
+if is_up_to_date; then
   say "${APP_NAME} up to date"
   exit 0
 fi
@@ -81,49 +140,8 @@ if ! mkdir -p "$BUNDLE/Contents/MacOS" "$BUNDLE/Contents/Resources"; then
   exit 1
 fi
 
-# CFBundleIdentifier is load-bearing and deliberately stable: macOS keys every
-# TCC privacy grant (and the single-instance sweep in main.swift) to it, so
-# changing it makes the system forget every permission this app was given.
-# Change it BEFORE the first build if you want your own, never after.
-cat >"$BUNDLE/Contents/Info.plist" <<'PLIST'
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>CFBundleName</key><string>Claude Meter</string>
-  <key>CFBundleDisplayName</key><string>Claude Meter</string>
-  <key>CFBundleIdentifier</key><string>local.ayushsharma.claude-meter</string>
-  <key>CFBundleExecutable</key><string>ClaudeMeter</string>
-  <!-- CFBundleIconFile is the pre-macOS-26 path (Resources/AppIcon.icns).
-       CFBundleIconName, which points at the appearance-aware icon inside
-       Assets.car, is added below only when actool actually produced one. -->
-  <key>CFBundleIconFile</key><string>AppIcon</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>LSMinimumSystemVersion</key><string>14.0</string>
-  <key>NSHighResolutionCapable</key><true/>
-  <!-- Menu-bar only: no Dock tile, no app menu. Matches setActivationPolicy(.accessory). -->
-  <key>LSUIElement</key><true/>
-</dict>
-</plist>
-PLIST
-
-say "compiling"
-# Compile beside the target and rename into place: swiftc -o straight onto the
-# installed path truncates the inode a RUNNING meter has mapped, which can
-# SIGBUS it mid-draw. A same-volume rename gives the new build a fresh inode
-# and the old process keeps its pages until it exits.
-if ! "$SWIFTC" -O -whole-module-optimization \
-      -framework AppKit \
-      -o "$BIN.new" "$SOURCES/main.swift" 2>"$SRC_DIR/.build.log"; then
-  say "BUILD FAILED — see $SRC_DIR/.build.log"
-  tail -15 "$SRC_DIR/.build.log" | sed 's/^/      /'
-  rm -f "$BIN.new"
-  exit 1
-fi
-chmod +x "$BIN.new"
-mv -f "$BIN.new" "$BIN"
-rm -f "$SRC_DIR/.build.log"
+write_info_plist
+compile_app
 
 # ── App icon ─────────────────────────────────────────────────────────────────
 # Drawn from Sources/icon.swift at build time, so no binary asset lives in the

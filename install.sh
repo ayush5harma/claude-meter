@@ -33,6 +33,15 @@ CACHE_DIR="${CLAUDE_METER_CACHE_DIR:-$HOME/.cache/claude-meter}"
 LOG="$CACHE_DIR/claude-meter.launchd.log"
 DOMAIN="gui/$(id -u)"
 
+say() { printf '  %s\n' "$*"; }
+
+# The header comment above IS the help text: printing it from the file keeps the
+# two from drifting, where a hardcoded line range went stale the moment anyone
+# edited the header. It stops at the first line that is not a comment, so the
+# header has to stay one unbroken block of `#` lines -- a blank line in the
+# middle of it would cut the help short.
+usage() { awk 'NR > 1 && /^#/ { print; next } NR > 1 { exit }' "${BASH_SOURCE[0]}"; }
+
 MODE=install
 FORCE=""
 PURGE=0
@@ -41,13 +50,11 @@ while [ "$#" -gt 0 ]; do
     --uninstall) MODE=uninstall ;;
     --purge) PURGE=1 ;;
     --force) FORCE="--force" ;;
-    -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
+    -h|--help) usage; exit 0 ;;
     *) printf 'install.sh: unknown argument %s\n' "$1" >&2; exit 64 ;;
   esac
   shift
 done
-
-say() { printf '  %s\n' "$*"; }
 
 unload_agent() {
   # bootout returns non-zero when the label is not loaded, which is the normal
@@ -55,42 +62,67 @@ unload_agent() {
   launchctl bootout "$DOMAIN/$AGENT_LABEL" >/dev/null 2>&1 || true
 }
 
-if [ "$MODE" = uninstall ]; then
+# ── Uninstall ───────────────────────────────────────────────────────────────
+
+# The cache holds the API answer, the backoff stamp and the usage history, so it
+# goes only when asked for. CLAUDE_METER_CACHE_DIR is an environment variable,
+# which means it can arrive relative, or as something no uninstaller should ever
+# recurse into: this refuses anything that is not an absolute path at least two
+# levels deep AND holding at least one of this app's own files -- `rm -rf` does
+# not get the benefit of the doubt.
+#
+# The empty case never reaches here, and that is worth knowing rather than
+# assuming: CACHE_DIR is set with `${CLAUDE_METER_CACHE_DIR:-...}`, so
+# `CLAUDE_METER_CACHE_DIR= bash install.sh --uninstall --purge` falls back to the
+# real default and deletes ~/.cache/claude-meter (measured 2026-09-16, on a real
+# cache). Dropping the colon would send an explicit empty value to the -z test
+# below instead; that is a behaviour change, so it is not made here.
+purge_cache() {
+  # The trailing newline matters: awk reads no line at all from an empty string,
+  # prints nothing, and the numeric test below would then error out rather than
+  # refuse -- which is how CACHE_DIR="/" would have slipped past.
+  local depth owns=0 name
+  depth="$(printf '%s\n' "${CACHE_DIR%/}" | awk -F/ '{print NF-1}')"
+  if [ -z "$CACHE_DIR" ] || [ "${CACHE_DIR#/}" = "$CACHE_DIR" ] || [ "${depth:-0}" -lt 2 ]; then
+    say "refusing to delete '$CACHE_DIR' — not a plausible cache directory"
+    return
+  fi
+  if [ ! -d "$CACHE_DIR" ]; then
+    say "no cache at $CACHE_DIR"
+    return
+  fi
+  for name in usage-api.json usage-history.csv usage-api.backoff claude-meter.launchd.log; do
+    [ -e "$CACHE_DIR/$name" ] && owns=1
+  done
+  if [ "$owns" -eq 0 ]; then
+    say "refusing to delete $CACHE_DIR — it holds none of this app's files"
+    return
+  fi
+  rm -rf "$CACHE_DIR" && say "removed $CACHE_DIR"
+}
+
+uninstall() {
   unload_agent
   say "agent $AGENT_LABEL unloaded"
   # Say "removed" only about something that was there: `rm -f` succeeds on a
   # path that never existed, and an uninstaller that reports work it did not do
   # is the same lie as a meter reporting a number it did not fetch.
-  for p in "$PLIST" "$STATS"; do
-    if [ -e "$p" ]; then rm -f "$p" && say "removed $p"; fi
+  for path in "$PLIST" "$STATS"; do
+    if [ -e "$path" ]; then rm -f "$path" && say "removed $path"; fi
   done
   if [ -d "$BUNDLE" ]; then
     rm -rf "$BUNDLE" && say "removed $BUNDLE"
   fi
   if [ "$PURGE" -eq 1 ]; then
-    # CLAUDE_METER_CACHE_DIR is an environment variable, so it can arrive empty
-    # or as something no uninstaller should ever recurse into. Refuse anything
-    # that is not an absolute path at least three levels deep and holding at
-    # least one of this app's own files -- `rm -rf` does not get the benefit of
-    # the doubt.
-    # The trailing newline matters: awk reads no line at all from an empty
-    # string, prints nothing, and the numeric test below would then error out
-    # rather than refuse -- which is how CACHE_DIR="/" would have slipped past.
-    depth="$(printf '%s\n' "${CACHE_DIR%/}" | awk -F/ '{print NF-1}')"
-    if [ -z "$CACHE_DIR" ] || [ "${CACHE_DIR#/}" = "$CACHE_DIR" ] || [ "${depth:-0}" -lt 2 ]; then
-      say "refusing to delete '$CACHE_DIR' — not a plausible cache directory"
-    elif [ ! -d "$CACHE_DIR" ]; then
-      say "no cache at $CACHE_DIR"
-    elif [ ! -e "$CACHE_DIR/usage-api.json" ] && [ ! -e "$CACHE_DIR/usage-history.csv" ] \
-         && [ ! -e "$CACHE_DIR/usage-api.backoff" ] && [ ! -e "$CACHE_DIR/claude-meter.launchd.log" ]; then
-      say "refusing to delete $CACHE_DIR — it holds none of this app's files"
-    else
-      rm -rf "$CACHE_DIR" && say "removed $CACHE_DIR"
-    fi
+    purge_cache
   else
     say "kept $CACHE_DIR (pass --purge to delete the usage history too)"
   fi
   say "uninstalled"
+}
+
+if [ "$MODE" = uninstall ]; then
+  uninstall
   exit 0
 fi
 

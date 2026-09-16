@@ -64,50 +64,55 @@ export PATH
 py_out="$(mktemp)"
 python3 - <<'PY' >"$py_out" 2>/dev/null
 import json, pathlib, datetime, hashlib, math, os, subprocess, time
+from collections import namedtuple
 
-def load(p):
-    try: return json.loads(pathlib.Path(p).read_text())
-    except Exception: return None
+HOME = pathlib.Path.home()
+DEFAULT_CONFIG_DIR = HOME / ".claude"
 
-home = pathlib.Path.home()
-
-# ── LIVE usage, from the same endpoint /usage calls ─────────────────────────
-# `cachedUsageUtilization` is only rewritten while claude runs, so reading it
-# alone left the menu bar as fresh as the last session (5 h stale, with an
-# already-expired session window). /usage GETs this endpoint with the profile's
-# OAuth token and the response carries the SAME limits[] shape, so this calls
-# it too.
-#
-# THE ENDPOINT RATE-LIMITS. A 25 s TTL while claude ran is ~120 requests/hour
-# against the app's 30 s poll: the endpoint answered 429 and STAYED 429 because
-# every poll retried instantly, and the meter fell back to the file cache
-# forever while looking live (2026-09-01: 30% shown from a 3 h-old cache while
-# the last good API answer, 7 minutes earlier, said 46%). Three rules fix it:
-#   1. TTL 120 s while a claude process is alive, 900 s idle -- limits move
-#      slowly; ~30 req/h is plenty current and far below the 429 threshold.
-#   2. Any fetch failure writes a BACKOFF stamp (900 s for a 429, 180 s
-#      otherwise) and no network attempt happens while it is fresh.
-#   3. The reading shown is the FRESHEST of (last good API answer, session
-#      file cache), with its age reported -- the first cut ignored the API
-#      cache once past TTL and regressed to older file-cache numbers.
-API_URL = "https://api.anthropic.com/api/oauth/usage"
-CACHE_DIR = pathlib.Path(os.environ.get("CLAUDE_METER_CACHE_DIR") or (home / ".cache" / "claude-meter"))
+CACHE_DIR = pathlib.Path(os.environ.get("CLAUDE_METER_CACHE_DIR") or (HOME / ".cache" / "claude-meter"))
 API_CACHE = CACHE_DIR / "usage-api.json"
 BACKOFF = CACHE_DIR / "usage-api.backoff"
+HISTORY = CACHE_DIR / "usage-history.csv"
 
-def _claude_running():
+# The three limits the app draws, keyed by the endpoint's own `kind`.
+LIMIT_KEYS = {"session": "session", "weekly_all": "weekly", "weekly_scoped": "scoped"}
+
+# Roll a PAST resets_at forward ONLY for the weekly limits: their reset is a
+# fixed schedule, so adding whole weeks states a fact. The session window is
+# NOT on a grid -- a new 5 h window anchors on first use after idle -- so rolling
+# it forward fabricated countdowns ("resets in 1h57" for a window that ended
+# hours ago). A past session reset now reports 0 and the app shows a dash.
+RESET_CADENCE = {"weekly_all": 7 * 86400, "weekly_scoped": 7 * 86400}
+
+# Why the live path is not serving, in words the dropdown can print.
+FETCH_ERROR_TEXT = {"429": "rate-limited", "token": "no valid token",
+                    "shape": "bad response", "net": "network error"}
+
+# What the scoped weekly cap applies to when the response names nothing --
+# better a generic word than a model family this script invented.
+DEFAULT_SCOPED_LABEL = "Model"
+
+# A history point is recorded only when a value CHANGES or this long has passed:
+# the session cache is flat between claude runs, so a 30 s poll would otherwise
+# write ~2880 identical rows a day for no information. The cap keeps the file to
+# a few tens of KB.
+HISTORY_MIN_INTERVAL = 600
+HISTORY_MAX_ROWS = 2000
+
+
+def load_json(path):
     try:
-        r = subprocess.run(["pgrep", "-f", r"(^|/)claude($| )"],
-                           capture_output=True, text=True, timeout=5)
-        return r.returncode == 0 and bool(r.stdout.strip())
+        return json.loads(pathlib.Path(path).read_text())
     except Exception:
-        return False
+        return None
 
-API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or (120 if _claude_running() else 900)
 
-DEFAULT_DIR = home / ".claude"
+# ── Identities ──────────────────────────────────────────────────────────────
 
-def parse_entry(spec):
+Identity = namedtuple("Identity", "config_dir label email cached_utilization cached_at")
+
+
+def parse_config_dirs_entry(spec):
     """One CLAUDE_METER_CONFIG_DIRS entry: "path", or "label=path" to name the
     identity yourself instead of taking the name from the directory.
 
@@ -119,6 +124,7 @@ def parse_entry(spec):
         return pathlib.Path(os.path.expanduser(tail.strip())), head.strip()
     return pathlib.Path(os.path.expanduser(spec.strip())), None
 
+
 def config_dirs():
     """Every Claude Code identity to consider, as (path, label or None), in
     discovery order.
@@ -129,58 +135,144 @@ def config_dirs():
     ~/.claude-<name> directory that actually holds a config file (that is how a
     second identity is kept on one Mac -- CLAUDE_CONFIG_DIR pointed at it in the
     shell that launches it)."""
-    override = os.environ.get("CLAUDE_METER_CONFIG_DIRS", "").strip()
     seen, out = set(), []
-    def add(d, label=None):
-        k = str(d)
-        if k not in seen:
-            seen.add(k)
-            out.append((d, label))
+
+    def add(path, label=None):
+        if str(path) not in seen:
+            seen.add(str(path))
+            out.append((path, label))
+
+    override = os.environ.get("CLAUDE_METER_CONFIG_DIRS", "").strip()
     if override:
         for spec in override.split(":"):
             if spec.strip():
-                d, label = parse_entry(spec)
-                add(d, label)
+                add(*parse_config_dirs_entry(spec))
         return out
-    for p in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":"):
-        if p.strip():
-            add(pathlib.Path(os.path.expanduser(p.strip())))
-    add(DEFAULT_DIR)
+    for spec in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":"):
+        if spec.strip():
+            add(pathlib.Path(os.path.expanduser(spec.strip())))
+    add(DEFAULT_CONFIG_DIR)
     try:
-        for p in sorted(home.glob(".claude-*")):
-            if p.is_dir() and (p / ".claude.json").exists():
-                add(p)
+        for path in sorted(HOME.glob(".claude-*")):
+            if path.is_dir() and (path / ".claude.json").exists():
+                add(path)
     except Exception:
         pass
     return out
 
-def label_for(d, override=None):
+
+def label_for(config_dir, override=None):
     """A short name for the identity, shown beside the account email. An
     explicit label from CLAUDE_METER_CONFIG_DIRS wins: the name is what a
     person recognises the account by, and the directory it happens to live in
     need not say it."""
     if override:
         return override
-    if d == DEFAULT_DIR:
+    if config_dir == DEFAULT_CONFIG_DIR:
         return "default"
-    n = d.name.lstrip(".")
-    if n.startswith("claude-"):
-        n = n[len("claude-"):]
-    return n or str(d)
+    name = config_dir.name.lstrip(".")
+    if name.startswith("claude-"):
+        name = name[len("claude-"):]
+    return name or str(config_dir)
 
-def config_file(d):
+
+def config_file(config_dir):
     """Claude Code keeps the DEFAULT identity's config beside its state
     directory (~/.claude.json, not ~/.claude/.claude.json); a custom
     CLAUDE_CONFIG_DIR holds both. Prefer whichever actually exists."""
-    cands = [d / ".claude.json"]
-    if d == DEFAULT_DIR:
-        cands.insert(0, home / ".claude.json")
-    for c in cands:
-        if c.exists():
-            return c
-    return cands[0]
+    candidates = [config_dir / ".claude.json"]
+    if config_dir == DEFAULT_CONFIG_DIR:
+        candidates.insert(0, HOME / ".claude.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
-def service_for(d):
+
+def newest_live_session(config_dir):
+    """Newest updatedAt (seconds) among this identity's LIVE sessions, read from
+    the registry Claude Code keeps in <config dir>/sessions/<pid>.json; 0 when
+    the identity has no live session."""
+    newest = 0.0
+    try:
+        for path in (config_dir / "sessions").glob("*.json"):
+            try:
+                session = json.loads(path.read_text())
+                pid = int(session.get("pid") or 0)
+                if pid <= 0:
+                    continue
+                os.kill(pid, 0)    # raises when the process is gone
+                newest = max(newest, (session.get("updatedAt") or session.get("startedAt") or 0) / 1000)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return newest
+
+
+def pick_identity():
+    """The one identity to show, or None when nothing is known about any of
+    them: the newest live session wins, the freshest cachedUsageUtilization
+    only breaks a tie."""
+    best, best_rank = None, None
+    for config_dir, label_override in config_dirs():
+        config = load_json(config_file(config_dir))
+        if not isinstance(config, dict):
+            continue
+        cached = config.get("cachedUsageUtilization")
+        if not isinstance(cached, dict):
+            cached = {}
+        email = (config.get("oauthAccount") or {}).get("emailAddress") or ""
+        if not cached and not email:
+            continue      # nothing known about this identity
+        rank = (newest_live_session(config_dir), (cached.get("fetchedAtMs") or 0) / 1000)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best = Identity(config_dir, label_for(config_dir, label_override), email,
+                            cached.get("utilization") or {}, rank[1])
+    return best
+
+
+# ── The live usage endpoint ─────────────────────────────────────────────────
+#
+# `cachedUsageUtilization` is only rewritten while claude runs, so reading it
+# alone left the menu bar as fresh as the last session (5 h stale, with an
+# already-expired session window). /usage GETs this endpoint with the profile's
+# OAuth token and the response carries the SAME limits[] shape, so this calls
+# it too.
+#
+# THE ENDPOINT RATE-LIMITS. A 25 s TTL while claude ran is ~120 requests/hour
+# against the app's 30 s poll: the endpoint answered 429 and STAYED 429 because
+# every poll retried instantly, and the meter fell back to the file cache
+# forever while looking live (2026-09-01: 30% shown from a 3 h-old cache while
+# the last good API answer, 7 minutes earlier, said 46%). Limits move slowly, so
+# one call per TTL -- ~30 requests/hour -- is plenty current and far below the
+# threshold, and any failure parks the network path for a while afterwards.
+
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+TTL_WHILE_CLAUDE_RUNS = 120
+TTL_WHILE_IDLE = 900
+BACKOFF_AFTER_429 = 900
+BACKOFF_AFTER_OTHER = 180
+
+
+def claude_is_running():
+    try:
+        found = subprocess.run(["pgrep", "-f", r"(^|/)claude($| )"],
+                               capture_output=True, text=True, timeout=5)
+        return found.returncode == 0 and bool(found.stdout.strip())
+    except Exception:
+        return False
+
+
+API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or \
+    (TTL_WHILE_CLAUDE_RUNS if claude_is_running() else TTL_WHILE_IDLE)
+# Sampled here, after the running-session check above, as it always was: every
+# time-derived field (age_s, reset_in, fetched_at, the history row) moves with it.
+NOW = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def keychain_service(config_dir):
     # Claude Code keys its Keychain item to the config dir: the DEFAULT dir uses
     # the bare name, any other appends sha256(dir)[:8] (verified against a live
     # keychain). Deriving it beats a ~160 KB `security dump-keychain` per poll
@@ -193,20 +285,50 @@ def service_for(d):
     # Nothing here resolves symlinks or rewrites the path to "fix" a mismatch --
     # a normalisation this script invented would just be a second spelling to
     # be wrong in, and it would fail silently as "no valid token".
-    if d == DEFAULT_DIR:
+    if config_dir == DEFAULT_CONFIG_DIR:
         return "Claude Code-credentials"
-    return "Claude Code-credentials-" + hashlib.sha256(str(d).encode()).hexdigest()[:8]
+    return "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
 
-def token_for(svc):
+
+def access_token(service):
     try:
-        raw = subprocess.run(["security", "find-generic-password", "-s", svc, "-w"],
+        raw = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
                              capture_output=True, text=True, timeout=10).stdout.strip()
-        o = json.loads(raw).get("claudeAiOauth", {})
-        if o.get("accessToken") and o.get("expiresAt", 0) > time.time() * 1000:
-            return o["accessToken"]
+        oauth = json.loads(raw).get("claudeAiOauth", {})
+        if oauth.get("accessToken") and oauth.get("expiresAt", 0) > time.time() * 1000:
+            return oauth["accessToken"]
     except Exception:
         pass
     return None
+
+
+def fetch_usage(config_dir):
+    """One attempt with THIS identity's token only. Returns (data, errkind)."""
+    token = access_token(keychain_service(config_dir))
+    if not token:
+        return None, "token"     # expired/absent: claude refreshes it, not us
+    try:
+        # The token reaches curl on STDIN (`--config -`), never argv and never a
+        # file: argv is world-readable through `ps`, and a temporary file -- even
+        # one created 0600 and unlinked in a finally -- still puts the token on
+        # disk, where a crash between write and unlink leaves it. A pipe exists
+        # only between these two processes and dies with them.
+        config = ('header = "Authorization: Bearer %s"\n'
+                  'header = "anthropic-beta: oauth-2025-04-20"\n'
+                  'header = "Content-Type: application/json"\n' % token)
+        answer = subprocess.run(["curl", "-sS", "--max-time", "15",
+                                 "-w", "\n%{http_code}", "--config", "-", API_URL],
+                                input=config, capture_output=True, text=True, timeout=20)
+        body, _, code = answer.stdout.rpartition("\n")
+        if code.strip() == "429":
+            return None, "429"
+        data = json.loads(body)
+        if isinstance(data, dict) and data.get("limits"):
+            return data, None
+        return None, "shape"
+    except Exception:
+        return None, "net"
+
 
 def backoff_state():
     """(active, why, retry_in_s) from the stamp. The WHY is kept so a poll
@@ -215,234 +337,193 @@ def backoff_state():
     is exactly the lie this meter exists not to tell."""
     try:
         parts = BACKOFF.read_text().split()
-        t, wait = float(parts[0]), float(parts[1])
+        stamped_at, wait = float(parts[0]), float(parts[1])
         why = parts[2] if len(parts) > 2 else "error"
-        left = t + wait - time.time()
+        left = stamped_at + wait - time.time()
         return left > 0, why, max(0, int(left))
     except Exception:
         return False, "", 0
 
-def set_backoff(seconds, why):
+
+def start_backoff(seconds, why):
     try:
         BACKOFF.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
         BACKOFF.write_text("%d %d %s" % (time.time(), seconds, why))
     except Exception:
         pass
 
-def api_cache_load(label, email):
+
+def load_api_cache(identity):
     # The cache records WHICH account it holds -- the identity label AND the
     # email: on a machine where the shown identity flips, or where /login moved
     # an identity to another account, a cached answer for a different account
     # must read as "no cache", not as data.
-    d = load(API_CACHE)
-    if isinstance(d, dict) and d.get("account") == label and d.get("email", "") == email \
-            and isinstance(d.get("data"), dict):
-        return d["data"], float(d.get("fetched_at") or 0)
+    cached = load_json(API_CACHE)
+    if isinstance(cached, dict) and cached.get("account") == identity.label \
+            and cached.get("email", "") == identity.email \
+            and isinstance(cached.get("data"), dict):
+        return cached["data"], float(cached.get("fetched_at") or 0)
     return None, 0.0
 
-def fetch_live(cfg_dir):
-    """One attempt with THIS identity's token only. Returns (data, errkind)."""
-    tok = token_for(service_for(cfg_dir))
-    if not tok:
-        return None, "token"     # expired/absent: claude refreshes it, not us
-    try:
-        # The token reaches curl on STDIN (`--config -`), never argv and never a
-        # file: argv is world-readable through `ps`, and a temporary file -- even
-        # one created 0600 and unlinked in a finally -- still puts the token on
-        # disk, where a crash between write and unlink leaves it. A pipe exists
-        # only between these two processes and dies with them.
-        cfg = ('header = "Authorization: Bearer %s"\n'
-               'header = "anthropic-beta: oauth-2025-04-20"\n'
-               'header = "Content-Type: application/json"\n' % tok)
-        r = subprocess.run(["curl", "-sS", "--max-time", "15",
-                            "-w", "\n%{http_code}", "--config", "-", API_URL],
-                           input=cfg, capture_output=True, text=True, timeout=20)
-        body, _, code = r.stdout.rpartition("\n")
-        if code.strip() == "429":
-            return None, "429"
-        d = json.loads(body)
-        if isinstance(d, dict) and d.get("limits"):
-            return d, None
-        return None, "shape"
-    except Exception:
-        return None, "net"
 
-def last_activity(cfg_dir):
-    """Newest updatedAt (seconds) among this identity's LIVE sessions, read from
-    the registry Claude Code keeps in <config dir>/sessions/<pid>.json; 0 when
-    the identity has no live session."""
-    newest = 0.0
+def save_api_cache(identity, data):
     try:
-        for p in (cfg_dir / "sessions").glob("*.json"):
-            try:
-                s = json.loads(p.read_text())
-                pid = int(s.get("pid") or 0)
-                if pid <= 0: continue
-                os.kill(pid, 0)    # raises when the process is gone
-                newest = max(newest, (s.get("updatedAt") or s.get("startedAt") or 0) / 1000)
-            except Exception:
-                continue
+        # 0700/0600: this file holds the account's email address and the full
+        # usage response. Nothing here is a credential, but it is this user's
+        # data and no other account on the Mac needs it.
+        CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        API_CACHE.write_text(json.dumps(
+            {"account": identity.label, "email": identity.email, "fetched_at": NOW, "data": data}))
+        os.chmod(API_CACHE, 0o600)
+        if BACKOFF.exists():
+            BACKOFF.unlink()
     except Exception:
         pass
-    return newest
 
-now = datetime.datetime.now(datetime.timezone.utc).timestamp()
 
-# Roll a PAST resets_at forward ONLY for the weekly limits: their reset is a
-# fixed schedule, so adding whole weeks states a fact. The session window is
-# NOT on a grid -- a new 5 h window anchors on first use after idle -- so rolling
-# it forward fabricated countdowns ("resets in 1h57" for a window that ended
-# hours ago). A past session reset now reports 0 and the app shows a dash.
-CADENCE = {"weekly_all": 7 * 86400, "weekly_scoped": 7 * 86400}
+# ── The reading to show ─────────────────────────────────────────────────────
 
-def reset_in(iso, kind=None):
-    if not iso: return 0
+Reading = namedtuple("Reading", "utilization taken_at source fetch_error retry_in")
+
+
+def current_reading(identity):
+    """The freshest utilisation this identity has, from the API when the cache
+    is past its TTL and the network path is not parked.
+
+    FRESHEST WINS, whatever its origin: a 5-minute-old API answer beats a
+    3-hour-old session cache even when both are past their nominal TTL. The
+    first cut ignored the API cache once past TTL and regressed to the older
+    file-cache numbers."""
+    data, fetched_at = load_api_cache(identity)
+    in_backoff, fail_why, retry_in = backoff_state()
+    if (data is None or NOW - fetched_at >= API_TTL) and not in_backoff:
+        fresh, err = fetch_usage(identity.config_dir)
+        if fresh:
+            data, fetched_at = fresh, NOW
+            fail_why, retry_in = "", 0
+            save_api_cache(identity, fresh)
+        else:
+            wait = BACKOFF_AFTER_429 if err == "429" else BACKOFF_AFTER_OTHER
+            start_backoff(wait, err)
+            fail_why, retry_in = err, wait
+    if data is not None and fetched_at >= identity.cached_at:
+        return Reading(data, fetched_at, "api", fail_why, retry_in)
+    return Reading(identity.cached_utilization, identity.cached_at, "session-cache", fail_why, retry_in)
+
+
+def seconds_until_reset(iso, kind=None):
+    if not iso:
+        return 0
     try:
-        t = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+        resets_at = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
     except Exception:
         return 0
-    d = t - now
-    if d < 0:
-        cad = CADENCE.get(kind or "", 0)
-        if cad <= 0: return 0
-        d += math.ceil((-d) / cad) * cad
-    return max(0, int(d))
+    left = resets_at - NOW
+    if left < 0:
+        cadence = RESET_CADENCE.get(kind or "", 0)
+        if cadence <= 0:
+            return 0
+        left += math.ceil((-left) / cadence) * cadence
+    return max(0, int(left))
 
-best = None
-for cfg_dir, label_override in config_dirs():
-    d = load(config_file(cfg_dir))
-    if not isinstance(d, dict): continue
-    cu = d.get("cachedUsageUtilization")
-    if not isinstance(cu, dict): cu = {}
-    email = ((d.get("oauthAccount") or {}).get("emailAddress") or "")
-    if not cu and not email: continue      # nothing known about this identity
-    fetched = (cu.get("fetchedAtMs") or 0) / 1000
-    rank = (last_activity(cfg_dir), fetched)
-    if best is None or rank > best[0]:
-        best = (rank, fetched, cfg_dir, cu, email, label_override)
 
-if best is None:
-    print(json.dumps({"ok": False}))
-else:
-    _, file_at, cfg_dir, cu, email, label_override = best
-    label = label_for(cfg_dir, label_override)
+def limits_and_scoped_label(utilization):
+    """The three limits the app draws, plus what the endpoint says the scoped
+    weekly cap applies to.
 
-    api_data, api_at = api_cache_load(label, email)
-    in_backoff, fail_why, retry_in = backoff_state()
-    if (api_data is None or now - api_at >= API_TTL) and not in_backoff:
-        d, err = fetch_live(cfg_dir)
-        if d:
-            api_data, api_at = d, now
-            fail_why, retry_in = "", 0
-            try:
-                # 0700/0600: this file holds the account's email address and the
-                # full usage response. Nothing here is a credential, but it is
-                # this user's data and no other account on the Mac needs it.
-                CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-                API_CACHE.write_text(json.dumps(
-                    {"account": label, "email": email, "fetched_at": now, "data": d}))
-                os.chmod(API_CACHE, 0o600)
-                if BACKOFF.exists(): BACKOFF.unlink()
-            except Exception:
-                pass
-        else:
-            wait = 900 if err == "429" else 180
-            set_backoff(wait, err)
-            fail_why, retry_in = err, wait
-
-    # FRESHEST WINS, whatever its origin: a 5-minute-old API answer beats a
-    # 3-hour-old session cache even when both are past their nominal TTL.
-    if api_data is not None and api_at >= file_at:
-        u, data_at, source = api_data, api_at, "api"
-    else:
-        u, data_at, source = (cu.get("utilization") or {}), file_at, "session-cache"
-
-    out = {}
-    scoped_label = ""
-    for L in (u.get("limits") or []):
-        kind = L.get("kind")
-        key = {"session": "session", "weekly_all": "weekly", "weekly_scoped": "scoped"}.get(kind)
-        if not key: continue
-        out[key] = {
-            "pct": int(L.get("percent") or 0),
-            "reset_in": reset_in(L.get("resets_at"), kind),
-            "severity": L.get("severity") or "normal",
+    THE ENDPOINT NAMES THE CAP ITSELF, so nothing here hardcodes a model family
+    that will be wrong at the next release. Inspected 2026-09-12: every limits[]
+    entry carries `scope`, null on the session and all-models limits and, on
+    weekly_scoped, {"model": {"id": null, "display_name": "<name>"},
+    "surface": null}. The flat legacy keys beside limits[] (seven_day_opus and
+    friends) were null in the same response, so they are not a second source."""
+    limits, scoped_label = {}, ""
+    for limit in (utilization.get("limits") or []):
+        kind = limit.get("kind")
+        key = LIMIT_KEYS.get(kind)
+        if not key:
+            continue
+        limits[key] = {
+            "pct": int(limit.get("percent") or 0),
+            "reset_in": seconds_until_reset(limit.get("resets_at"), kind),
+            "severity": limit.get("severity") or "normal",
         }
         if key == "scoped":
-            # THE ENDPOINT NAMES THE CAP ITSELF, so nothing here hardcodes a
-            # model family that will be wrong at the next release. Inspected
-            # 2026-09-12: every limits[] entry carries `scope`, null on the
-            # session and all-models limits and, on weekly_scoped,
-            # {"model": {"id": null, "display_name": "<name>"}, "surface": null}.
-            # The flat legacy keys beside limits[] (seven_day_opus and friends)
-            # were null in the same response, so they are not a second source.
-            m = (L.get("scope") or {}).get("model") or {}
-            scoped_label = (m.get("display_name") or "").strip()
+            model = (limit.get("scope") or {}).get("model") or {}
+            scoped_label = (model.get("display_name") or "").strip()
     # Fall back to the flat structure if limits[] is absent on an older client.
-    for key, src, kind in (("session", "five_hour", "session"), ("weekly", "seven_day", "weekly_all")):
-        if key not in out and isinstance(u.get(src), dict):
-            out[key] = {"pct": int(u[src].get("utilization") or 0),
-                        "reset_in": reset_in(u[src].get("resets_at"), kind),
-                        "severity": "normal"}
+    for key, flat_key, kind in (("session", "five_hour", "session"),
+                                ("weekly", "seven_day", "weekly_all")):
+        flat = utilization.get(flat_key)
+        if key not in limits and isinstance(flat, dict):
+            limits[key] = {"pct": int(flat.get("utilization") or 0),
+                           "reset_in": seconds_until_reset(flat.get("resets_at"), kind),
+                           "severity": "normal"}
+    return limits, scoped_label
+
+
+def append_history(label, limits):
+    """Append a point to the usage history the menu graphs."""
+    try:
+        HISTORY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The label is user-supplied (CLAUDE_METER_CONFIG_DIRS), and this is a
+        # five-field CSV parsed by position: a comma in it would shift every
+        # later field and the row would be dropped as malformed by the reader --
+        # and by the dedupe check here, which rewrites the whole file every poll.
+        row = "%d,%s,%d,%d,%d" % (int(NOW), label.replace(",", "-"),
+                                  limits.get("session", {}).get("pct", 0),
+                                  limits.get("weekly", {}).get("pct", 0),
+                                  limits.get("scoped", {}).get("pct", 0))
+        rows = HISTORY.read_text().splitlines() if HISTORY.exists() else []
+        if rows:
+            last = rows[-1].split(",")
+            unchanged = len(last) == 5 and last[1:] == row.split(",")[1:]
+            if unchanged and int(NOW) - int(last[0]) < HISTORY_MIN_INTERVAL:
+                return
+        rows.append(row)
+        HISTORY.write_text("\n".join(rows[-HISTORY_MAX_ROWS:]) + "\n")
+    except Exception:
+        pass
+
+
+def main():
+    identity = pick_identity()
+    if identity is None:
+        print(json.dumps({"ok": False}))
+        return
+    reading = current_reading(identity)
+    limits, scoped_label = limits_and_scoped_label(reading.utilization)
+
     # NOTHING TO SHOW IS NOT "ok". An identity can be known by its email alone
     # -- a fresh /login whose cachedUsageUtilization has not been written yet --
     # and with the live path down that leaves no limits and no timestamp to age
     # them by. Emitted as ok:true (measured 2026-09-12) that produced
     # {"ok": true, "source": "session-cache", "age_s": 1789211658} -- the raw
-    # epoch, because the age is computed against a data_at of 0 -- and the app,
+    # epoch, because the age is computed against a taken_at of 0 -- and the app,
     # which gates only on ok, painted three grey 0% bars as if they were real.
     # A missing timestamp is disqualifying on its own: this meter's contract is
     # that every number carries its age, so a reading that cannot be aged is
     # not a reading. ok:false selects the app's own empty state, a dash.
-    if data_at <= 0 or not any(k in out for k in ("session", "weekly", "scoped")):
+    if reading.taken_at <= 0 or not limits:
         print(json.dumps({"ok": False}))
-    else:
-        out["ok"] = True
-        out["account"] = label
-        out["email"] = email
-        # What the scoped weekly cap applies to, for the UI to print. "Model" is
-        # the honest placeholder when the response names nothing -- better a
-        # generic word than a family name this script invented.
-        out["scoped_label"] = scoped_label or "Model"
-        out["source"] = source
-        out["age_s"] = max(0, int(now - data_at))
-        out["stale_hours"] = max(0.0, round((now - data_at) / 3600, 1))
-        # Why the live path is not serving, in words the dropdown can print.
-        if fail_why:
-            out["fetch_err"] = {"429": "rate-limited", "token": "no valid token",
-                                "shape": "bad response", "net": "network error",
-                                }.get(fail_why, fail_why)
-            out["retry_in"] = retry_in
-        print(json.dumps(out))
+        return
 
-        # Append a history point so the menu can draw a real usage graph.
-        # Recorded only when a value CHANGES or 10 minutes pass: the cache is
-        # flat between claude runs, so polling every 30s would otherwise write
-        # ~2880 identical rows a day for no information. Capped, so the file
-        # stays tens of KB.
-        try:
-            hp = CACHE_DIR / "usage-history.csv"
-            hp.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-            # The label is user-supplied (CLAUDE_METER_CONFIG_DIRS), and this is
-            # a five-field CSV parsed by position: a comma in it would shift
-            # every later field and the row would be dropped as malformed by the
-            # reader -- and by the dedupe check here, which rewrites the whole
-            # file every poll.
-            row = "%d,%s,%d,%d,%d" % (int(now), label.replace(",", "-"),
-                                      out.get("session", {}).get("pct", 0),
-                                      out.get("weekly", {}).get("pct", 0),
-                                      out.get("scoped", {}).get("pct", 0))
-            prev = hp.read_text().splitlines() if hp.exists() else []
-            keep = True
-            if prev:
-                f = prev[-1].split(",")
-                if len(f) == 5 and f[1:] == row.split(",")[1:] and int(now) - int(f[0]) < 600:
-                    keep = False
-            if keep:
-                prev.append(row)
-                hp.write_text("\n".join(prev[-2000:]) + "\n")
-        except Exception:
-            pass
+    out = dict(limits)
+    out["ok"] = True
+    out["account"] = identity.label
+    out["email"] = identity.email
+    out["scoped_label"] = scoped_label or DEFAULT_SCOPED_LABEL
+    out["source"] = reading.source
+    out["age_s"] = max(0, int(NOW - reading.taken_at))
+    out["stale_hours"] = max(0.0, round((NOW - reading.taken_at) / 3600, 1))
+    if reading.fetch_error:
+        out["fetch_err"] = FETCH_ERROR_TEXT.get(reading.fetch_error, reading.fetch_error)
+        out["retry_in"] = reading.retry_in
+    print(json.dumps(out))
+    append_history(identity.label, limits)
+
+
+main()
 PY
 claude_json="$(cat "$py_out")"
 rm -f "$py_out"
