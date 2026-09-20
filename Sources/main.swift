@@ -489,6 +489,12 @@ final class UsageView: NSView {
         if maxWidth != nil {
             let paragraph = NSMutableParagraphStyle()
             paragraph.lineBreakMode = .byTruncatingTail
+            // A width makes this a BOX, and a box needs to know which edge the
+            // text sits against: without this, `rightAligned` with a width
+            // would draw left-aligned inside a right-anchored box, which is
+            // neither alignment. Nothing passes both today; the combination is
+            // reachable, so it is right rather than absent.
+            paragraph.alignment = rightAligned ? .right : .left
             attributes[.paragraphStyle] = paragraph
         }
         let text = NSAttributedString(string: s, attributes: attributes)

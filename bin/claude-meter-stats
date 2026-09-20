@@ -752,7 +752,7 @@ def codex_window_label(minutes):
         if minutes % size == 0:
             count = minutes // size
             return one if count == 1 else many % count
-    return "%dm" % minutes
+    return ("%dm" % minutes)[:12]
 
 
 def codex_snapshot_limits(rate_limits, prefix=""):
@@ -774,6 +774,7 @@ def codex_snapshot_limits(rate_limits, prefix=""):
         used = codex_int(window.get("usedPercent"))
         if used is None:
             continue          # a window with no percentage is not a window
+        used = max(0, min(100, used))
         resets_at = codex_int(window.get("resetsAt"))
         label = codex_window_label(codex_int(window.get("windowDurationMins")))
         limits.append({
