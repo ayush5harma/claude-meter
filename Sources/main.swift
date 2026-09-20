@@ -20,6 +20,13 @@
 // thing making a number readable; a number goes warning-coloured only when a
 // limit is actually hot.
 //
+// ONE METER, EVERY AGENT. Claude Code owns the menu-bar glyph and the number
+// -- that is what this app is -- and any OTHER agentic CLI installed on this
+// Mac gets its own section in the dropdown, with the same gauges and the same
+// colours. A tool that is not installed contributes NOTHING: no section, no
+// empty row, no error. The collector simply does not name it, and this file
+// draws what it is given.
+//
 // IT COLLECTS NO DATA ITSELF. bin/claude-meter-stats emits the JSON.
 
 import AppKit
@@ -97,6 +104,29 @@ struct Stats {
     // family that a release would falsify; "Model" is the placeholder for a
     // response, or an older collector, that names nothing.
     var scopedLabel = "Model"
+}
+
+// One dropdown section for an agentic CLI that is NOT Claude Code. Its limits
+// arrive as a LIST rather than as three named fields, because how many usage
+// windows a tool has, and what each one means, is the tool's business: codex
+// reports one 30-day window on a free plan where a paid plan reports a 5-hour
+// one, so a fixed set of names here would be wrong for somebody.
+struct ToolReading {
+    var name = ""            // "Codex" — this app's word for the tool
+    var ok = false
+    var headline = ""        // account line beside the name, e.g. "you@example.com · free"
+    var source = ""
+    var ageS = -1
+    var fetchErr = ""
+    var retryIn = 0
+    var note = ""            // why there is nothing to show, in words
+    var limits: [(String, Limit)] = []
+}
+
+// Everything one collector run produced.
+struct Snapshot {
+    var claude = Stats()
+    var tools: [ToolReading] = []
 }
 
 // MARK: - Formatting
@@ -251,14 +281,29 @@ func barsGlyph(_ limits: [Limit], badge: NSColor? = nil) -> NSImage {
 final class UsageView: NSView {
     var limits: [(String, Limit)] = []
     var history: [HistoryPoint] = []
+    // A section with no recorded history draws ROWS ONLY. Drawing the graph
+    // anyway would put "collecting usage history…" under every tool that has
+    // none forever, which reads as a promise the meter is not keeping.
+    var drawsHistory = true
 
+    private static let rowHeight: CGFloat = 30
+    private static let graphHeight: CGFloat = 60
     private let pad: CGFloat = 14
     private let labelColumn: CGFloat = 60
-    private let graphHeight: CGFloat = 60
+    private let graphHeight: CGFloat = UsageView.graphHeight
+
+    // The exact height this view needs, so a section is sized from its own
+    // content instead of from a constant that has to be re-guessed every time a
+    // tool with a different number of limits is added.
+    static func height(rows: Int, history: Bool) -> CGFloat {
+        let rowsHeight = 10 + CGFloat(rows) * rowHeight
+        return history ? rowsHeight + 8 + graphHeight + 8 : rowsHeight + 8
+    }
 
     override func draw(_ dirty: NSRect) {
         NSGraphicsContext.current?.shouldAntialias = true
         let belowRows = drawLimitRows(top: bounds.height - 10)
+        guard drawsHistory else { return }
         let graphY = belowRows - 8 - graphHeight
         guard graphY > 4 else { return }
         drawHistory(in: NSRect(x: pad + labelColumn, y: graphY,
@@ -270,7 +315,7 @@ final class UsageView: NSView {
     // percentages. The first cut used 7pt bars, whose fill at 20-30% was a
     // barely-visible stub. Returns the y the rows end at.
     private func drawLimitRows(top: CGFloat) -> CGFloat {
-        let rowHeight: CGFloat = 30, barHeight: CGFloat = 12
+        let rowHeight = UsageView.rowHeight, barHeight: CGFloat = 12
         let percentColumn: CGFloat = 104
         let gaugeWidth = bounds.width - pad * 2 - labelColumn - percentColumn
         var y = top
@@ -377,6 +422,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private let statusMenu = NSMenu()
     private var stats = Stats()
+    // Sections for the other agentic CLIs, in the collector's order. Empty on
+    // a Mac that has none, which is what makes the menu identical to what it
+    // was before any of them were supported.
+    private var tools: [ToolReading] = []
     private var haveStats = false
     private var collectorPath = ""
     private var lastError: String?
@@ -474,7 +523,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard let self else { return }
                 self.collecting = false
                 if let parsed {
-                    self.stats = parsed; self.haveStats = true
+                    self.stats = parsed.claude; self.tools = parsed.tools; self.haveStats = true
                     self.lastError = nil; self.lastGoodCollection = Date(); self.failStreak = 0
                 } else {
                     self.lastError = error; self.failStreak += 1
@@ -486,7 +535,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // Runs the collector to completion and parses what it printed. Blocking:
     // callers are on a background queue.
-    private static func runCollector(_ script: String) -> (Stats?, String?) {
+    private static func runCollector(_ script: String) -> (Snapshot?, String?) {
         let collector = Process()
         collector.executableURL = URL(fileURLWithPath: "/bin/bash")
         collector.arguments = [script]
@@ -498,12 +547,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             return (nil, "collector failed to start")
         }
-        // Watchdog. The script bounds its own slow path (curl 15s), so 25s only
-        // trips when something is genuinely wedged; killing it turns a silent
-        // freeze into a visible error state. The read below still returns
-        // because every child holding the pipe is itself time-bounded.
+        // Watchdog. The collector's slow paths are its own: the Claude usage
+        // endpoint (curl 15s), and, when codex is installed, one bounded
+        // app-server read (10s) after it. 25s covered the first alone and would
+        // now kill a merely-slow run that did both, reporting a timeout for
+        // something that was working; 40s clears the realistic sum and still
+        // sits well under the 150s with no good collection that marks the meter
+        // sick. It is not a bound on the theoretical worst case -- adding up
+        // every timeout the collector can impose exceeds it, as it exceeded 25s
+        // before codex was ever read -- because those are the wedged cases this
+        // exists to turn into a visible error state rather than a silent freeze.
+        // The read below still returns because every child holding the pipe is
+        // itself time-bounded.
         let killer = DispatchWorkItem { if collector.isRunning { collector.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 25, execute: killer)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 40, execute: killer)
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
         collector.waitUntilExit()
         killer.cancel()
@@ -513,8 +570,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return (parsed, nil)
     }
 
-    private static func parse(_ data: Data) -> Stats? {
+    // The tools this app knows how to name, in menu order. A key the collector
+    // does not emit produces no section at all — presence gating lives in the
+    // collector, and this table only decides the human-readable name and the
+    // order. Adding a tool the collector learns to report is one row here.
+    private static let toolNames: [(key: String, name: String)] = [("codex", "Codex")]
+
+    private static func parse(_ data: Data) -> Snapshot? {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
+        var snapshot = Snapshot()
+        snapshot.tools = toolNames.compactMap { parseTool(root[$0.key], name: $0.name) }
         var s = Stats()
         if let c = root["claude"] as? [String: Any] {
             s.ok = c["ok"] as? Bool ?? false
@@ -532,7 +597,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             s.session = limit("session"); s.weekly = limit("weekly"); s.scoped = limit("scoped")
         }
-        return s
+        snapshot.claude = s
+        return snapshot
+    }
+
+    private static func parseTool(_ raw: Any?, name: String) -> ToolReading? {
+        guard let t = raw as? [String: Any] else { return nil }
+        var tool = ToolReading()
+        tool.name = name
+        tool.ok = t["ok"] as? Bool ?? false
+        tool.source = t["source"] as? String ?? ""
+        tool.ageS = t["age_s"] as? Int ?? -1
+        tool.fetchErr = t["fetch_err"] as? String ?? ""
+        tool.retryIn = t["retry_in"] as? Int ?? 0
+        tool.note = t["note"] as? String ?? ""
+        let account = [t["email"] as? String ?? "", t["plan"] as? String ?? ""]
+            .filter { !$0.isEmpty }
+        tool.headline = account.joined(separator: " · ")
+        for entry in (t["limits"] as? [[String: Any]] ?? []) {
+            tool.limits.append((entry["label"] as? String ?? "Limit",
+                                Limit(pct: entry["pct"] as? Int ?? 0,
+                                      resetIn: entry["reset_in"] as? Int ?? 0,
+                                      severity: entry["severity"] as? String ?? "normal")))
+        }
+        // A section claiming ok with no window is the same lie as a reading with
+        // no age: show the note instead of an empty gauge block.
+        if tool.limits.isEmpty { tool.ok = false }
+        return tool
     }
 
     // MARK: Bar rendering
@@ -604,7 +695,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                                             : "\(stats.email) · \(stats.account)")
         if haveStats, stats.ok {
             addFreshnessRows(menu)
-            let usage = UsageView(frame: NSRect(x: 0, y: 0, width: 340, height: 176))
+            let usage = UsageView(frame: NSRect(x: 0, y: 0, width: 340,
+                                                height: UsageView.height(rows: 3, history: true)))
             usage.limits = [("Session", stats.session), ("Week", stats.weekly),
                             (stats.scopedLabel, stats.scoped)]
             usage.history = loadHistory()
@@ -614,10 +706,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             addNote(menu, lastError ?? "Collecting…")
         }
+        addToolSections(menu)
         menu.addItem(.separator())
         addAction(menu, "Refresh Now", #selector(doRefresh), key: "r")
         menu.addItem(.separator())
         addAction(menu, "Quit Claude Meter", #selector(quit), key: "q")
+    }
+
+    // One section per other agentic CLI the collector reported on. Nothing is
+    // drawn for a tool it did not name, so this loop runs zero times on a Mac
+    // that has only Claude Code and the menu is unchanged.
+    private func addToolSections(_ menu: NSMenu) {
+        for tool in tools {
+            menu.addItem(.separator())
+            addHeader(menu, tool.headline.isEmpty ? "\(tool.name) usage"
+                                                  : "\(tool.name) · \(tool.headline)")
+            guard tool.ok else {
+                addNote(menu, tool.note.isEmpty ? "No usage data yet" : tool.note)
+                if !tool.fetchErr.isEmpty { addNote(menu, tool.fetchErr, color: .systemOrange) }
+                continue
+            }
+            let age = toolDataAge(tool)
+            let stale = age >= 45 * 60
+            addNote(menu, "\(tool.source.isEmpty ? "Usage" : tool.source) · read \(formatAge(age))",
+                    color: stale ? .systemOrange : .secondaryLabelColor)
+            if !tool.fetchErr.isEmpty {
+                let retry = tool.retryIn > 0 ? " · retry in \(max(1, tool.retryIn / 60))m" : ""
+                addNote(menu, "Live read \(tool.fetchErr)\(retry)", color: .systemOrange)
+            }
+            // Rows only, no graph: no history is recorded for these tools, and
+            // an empty plot under every one of them says nothing.
+            let usage = UsageView(frame: NSRect(
+                x: 0, y: 0, width: 340,
+                height: UsageView.height(rows: tool.limits.count, history: false)))
+            usage.limits = tool.limits
+            usage.drawsHistory = false
+            let item = NSMenuItem(); item.view = usage; menu.addItem(item)
+        }
+    }
+
+    // Same rule as the Claude section: the age shown is the age at collection
+    // plus the time since, so a number nobody has refreshed never reads current.
+    private func toolDataAge(_ tool: ToolReading) -> Int {
+        guard tool.ageS >= 0 else { return -1 }
+        let sinceCollection = lastGoodCollection.map { Int(Date().timeIntervalSince($0)) } ?? 0
+        return tool.ageS + max(0, sinceCollection)
     }
 
     private func addFreshnessRows(_ menu: NSMenu) {

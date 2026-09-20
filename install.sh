@@ -64,8 +64,9 @@ unload_agent() {
 
 # ── Uninstall ───────────────────────────────────────────────────────────────
 
-# The cache holds the API answer, the backoff stamp and the usage history, so it
-# goes only when asked for. CLAUDE_METER_CACHE_DIR is an environment variable,
+# The cache holds the API answer, the backoff stamp, the usage history and a
+# reading per other agentic CLI the collector found, so it goes only when asked
+# for. CLAUDE_METER_CACHE_DIR is an environment variable,
 # which means it can arrive relative, or as something no uninstaller should ever
 # recurse into: this refuses anything that is not an absolute path at least two
 # levels deep AND holding at least one of this app's own files -- `rm -rf` does
@@ -91,7 +92,12 @@ purge_cache() {
     say "no cache at $CACHE_DIR"
     return
   fi
-  for name in usage-api.json usage-history.csv usage-api.backoff claude-meter.launchd.log; do
+  # Every file this app's collector writes, not only the Claude ones: on a Mac
+  # where codex is signed in and Claude Code never was, codex-usage.json is the
+  # ONLY file in here, and an ownership list without it would refuse to purge a
+  # directory this app alone created.
+  for name in usage-api.json usage-history.csv usage-api.backoff \
+              codex-usage.json codex-usage.backoff claude-meter.launchd.log; do
     [ -e "$CACHE_DIR/$name" ] && owns=1
   done
   if [ "$owns" -eq 0 ]; then
