@@ -34,10 +34,13 @@ chmod +x "$WORK/bin/codex"
 # scratch. HOME is empty, so the Claude section reports ok:false and no network
 # call is made for it.
 collect() {
+  # GEMINI_HOME defaults to a directory that does not exist, so agy is absent
+  # unless a case deliberately sets one; a caller's value wins.
   CODEX_FIXTURE="$1" \
   PATH="$WORK/bin:/usr/bin:/bin" \
   HOME="$WORK/home" \
   CODEX_HOME="$WORK/home/.codex" \
+  GEMINI_HOME="${GEMINI_HOME:-$WORK/no-gemini}" \
   CLAUDE_METER_CACHE_DIR="$WORK/cache-$2" \
     bash "$COLLECTOR"
 }
@@ -63,7 +66,7 @@ out="$(collect "$HERE/free-single-window.json" free)"
 check "one window"        "$(printf '%s' "$out" | field '["limits"].__len__()')" "1"
 check "labelled 30-day"   "$(printf '%s' "$out" | field '["limits"][0]["label"]')" "30-day"
 check "plan free"         "$(printf '%s' "$out" | field '["plan"]')" "free"
-check "no bucket prefix"  "$(printf '%s' "$out" | field '["limits"][0]["label"].split()[0]')" "30-day"
+check "no details yet"    "$(printf '%s' "$out" | field '.get("details", ["Model: GPT-5.6-Terra"])[0]')" "Model: GPT-5.6-Terra"
 
 say "paid-two-windows — the 5-hour + weekly pair a paid plan reports"
 out="$(collect "$HERE/paid-two-windows.json" paid)"
@@ -88,6 +91,68 @@ check "reached=critical"  "$(printf '%s' "$out" | field '["limits"][2]["severity
 check "other bucket calm" "$(printf '%s' "$out" | field '["limits"][0]["severity"]')" "normal"
 check "state in words"    "$(printf '%s' "$out" | field '["details"][0]')" "Rate limit reached"
 check "unlimited credits" "$(printf '%s' "$out" | field '["details"][1]')" "Credits: unlimited"
+
+say "config.toml — the top-level model key, and the three stops that guard it"
+# Each case writes a config.toml and asserts what reached the MENU, which is
+# the only thing that matters: the claim being tested is that nothing from a
+# table, a multi-line string or a structure can get into the blob.
+cfg() { printf '%s' "$1" >"$WORK/home/.codex/config.toml"; }
+
+cfg 'model = "gpt-5.6-luna"
+approval_policy = "on-failure"
+'
+out="$(collect "$HERE/paid-two-windows.json" cfg1)"
+check "top-level model wins" "$(printf '%s' "$out" | field '["details"][1]')" "Model: GPT-5.6-Luna"
+
+cfg '[mcp_servers.github]
+http_headers = { Authorization = "Bearer ghp_NOTATOKEN" }
+model = "from-a-table"
+'
+out="$(collect "$HERE/paid-two-windows.json" cfg2)"
+check "stops at a table"     "$(printf '%s' "$out" | field '["details"][1]')" "Model: GPT-5.6-Terra"
+check "no token in the blob" "$(printf '%s' "$out" | grep -c ghp_NOTATOKEN || true)" "0"
+
+cfg 'notes = """
+model = "from-inside-a-string"
+"""
+'
+out="$(collect "$HERE/paid-two-windows.json" cfg3)"
+check "stops at \"\"\""        "$(printf '%s' "$out" | field '["details"][1]')" "Model: GPT-5.6-Terra"
+
+cfg 'model = { id = "a", token = "ghp_NOTATOKEN" }
+'
+out="$(collect "$HERE/paid-two-windows.json" cfg4)"
+check "refuses a structure"  "$(printf '%s' "$out" | field '["details"][1]')" "Model: GPT-5.6-Terra"
+check "structure not in blob" "$(printf '%s' "$out" | grep -c ghp_NOTATOKEN || true)" "0"
+
+cfg 'model = "gpt-5.6-luna"
+'
+out="$(CLAUDE_METER_CODEX_MODELS=0 collect "$HERE/paid-two-windows.json" cfg5)"
+check "MODELS=0 drops rows"  "$(printf '%s' "$out" | field '["details"]')" "['Credits: 1,250']"
+check "MODELS=0 keeps bars"  "$(printf '%s' "$out" | field '["limits"].__len__()')" "2"
+: >"$WORK/home/.codex/config.toml"
+
+say "no model/list — a codex too old to have it keeps its windows"
+out="$(collect "$HERE/no-model-list.json" nomodels)"
+check "windows survive"   "$(printf '%s' "$out" | field '["limits"].__len__()')" "2"
+check "no model row"      "$(printf '%s' "$out" | field '["details"]')" "['Credits: 1,250']"
+
+say "cache version — a cache from an older collector is not a cache"
+mkdir -p "$WORK/cache-stale"
+printf '{"fetched_at": 99999999999, "data": {"email": "old@example.com", "plan": "old", "rate_limits": {}}}' \
+  >"$WORK/cache-stale/codex-usage.json"
+out="$(collect "$HERE/paid-two-windows.json" stale)"
+check "refetched, not served" "$(printf '%s' "$out" | field '["plan"]')" "pro"
+
+say "agy — installed, no number, one line and no bars"
+mkdir -p "$WORK/gemini/antigravity-cli"
+printf '#!/bin/bash\nexit 0\n' >"$WORK/bin/agy"; chmod +x "$WORK/bin/agy"
+out="$(GEMINI_HOME="$WORK/gemini" collect "$HERE/paid-two-windows.json" agy)"
+check "agy key present"   "$(printf '%s' "$out" | python3 -c 'import json,sys; print("agy" in json.loads(sys.stdin.read()))')" "True"
+check "agy is a footnote" "$(printf '%s' "$out" | python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["agy"]["footnote"])')" "True"
+check "agy has no limits" "$(printf '%s' "$out" | python3 -c 'import json,sys; print("limits" in json.loads(sys.stdin.read())["agy"])')" "False"
+out="$(collect "$HERE/paid-two-windows.json" noagy)"
+check "no agy, no key"    "$(printf '%s' "$out" | python3 -c 'import json,sys; print("agy" in json.loads(sys.stdin.read()))')" "False"
 
 say "malformed — every field the wrong type"
 out="$(collect "$HERE/malformed.json" bad)"

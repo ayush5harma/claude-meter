@@ -806,22 +806,16 @@ def codex_limits(usage):
     particular duration; the fixtures under test/codex-fixtures drive the
     multi-bucket, multi-window case through this same code because no request
     to this account can produce one."""
-    buckets = usage.get("rateLimitsByLimitId")
-    if isinstance(buckets, dict) and buckets:
-        limits = []
-        # A bucket's id is a prefix only when there is more than one of them:
-        # with a single bucket (every account seen so far) it is the noise word
-        # "codex" in front of every row in a section already titled Codex.
-        named = len(buckets) > 1
-        for limit_id in sorted(buckets):
-            snapshot = buckets[limit_id]
-            if isinstance(snapshot, dict):
-                limits += codex_snapshot_limits(
-                    snapshot, (snapshot.get("limitName") or limit_id) if named else "")
-        if limits:
-            return limits
-    single = usage.get("rateLimits")
-    return codex_snapshot_limits(single) if isinstance(single, dict) else []
+    snapshots = codex_snapshots(usage)
+    # A bucket's id is a prefix only when there is more than one of them: with a
+    # single bucket (every account seen so far) it is the noise word "codex" in
+    # front of every row in a section already titled Codex.
+    named = len(snapshots) > 1
+    limits = []
+    for limit_id, snapshot in snapshots:
+        limits += codex_snapshot_limits(
+            snapshot, (snapshot.get("limitName") or limit_id) if named else "")
+    return limits
 
 
 # What the backend calls the state it is in, said in words a menu row can
@@ -837,29 +831,59 @@ RATE_LIMIT_REACHED_TEXT = {
 }
 
 
+def codex_snapshots(usage):
+    """Every rate-limit snapshot in the answer, in ONE deterministic order, so
+    the bars and the sentences under them can never be reading different halves
+    of the same response -- which they were: the bars preferred
+    `rateLimitsByLimitId` while the sentences read only `rateLimits`, the field
+    the schema itself calls backward-compatible, so the day the server stops
+    sending it the bars would have survived and the credits and the ceiling
+    would have vanished without a word (PR review, 2026-09-21)."""
+    buckets = usage.get("rateLimitsByLimitId")
+    if isinstance(buckets, dict) and buckets:
+        ordered = [(limit_id, buckets[limit_id]) for limit_id in sorted(buckets)
+                   if isinstance(buckets[limit_id], dict)]
+        if ordered:
+            return ordered
+    single = usage.get("rateLimits")
+    return [("", single)] if isinstance(single, dict) else []
+
+
 def codex_state_notes(usage):
     """The facts beside the bars: credits, and whether a ceiling has been hit.
 
     Said only when they SAY something. "Credits: none" under every window on
     every poll of a plan that has no credits is a row that never changes and
     never helps, and this meter's whole argument is that a number on screen
-    should be one somebody would act on."""
+    should be one somebody would act on. Deduplicated, because several metered
+    buckets on one account usually share one credit pool and one line about it
+    is the fact."""
     notes = []
-    snapshot = usage.get("rateLimits")
-    snapshot = snapshot if isinstance(snapshot, dict) else {}
-    reached = snapshot.get("rateLimitReachedType")
-    if isinstance(reached, str) and reached:
-        notes.append(RATE_LIMIT_REACHED_TEXT.get(reached, reached.replace("_", " ").capitalize()))
-    if snapshot.get("spendControlReached") is True:
-        notes.append("Spend control reached")
-    credits = snapshot.get("credits")
-    if isinstance(credits, dict):
-        if credits.get("unlimited") is True:
-            notes.append("Credits: unlimited")
-        elif credits.get("balance"):
-            notes.append("Credits: %s" % str(credits["balance"])[:24])
-        elif credits.get("hasCredits") is True:
-            notes.append("Credits available")
+
+    def add(text):
+        if text and text not in notes:
+            notes.append(text)
+
+    snapshots = codex_snapshots(usage)
+    # Ceilings before balances, across every bucket before any bucket's credits.
+    # Reading each bucket whole put "Credits: unlimited" above "Rate limit
+    # reached" purely because the bucket holding the credits sorted first, and
+    # a row saying you are stopped must not sit under a row saying you are fine.
+    for _, snapshot in snapshots:
+        reached = snapshot.get("rateLimitReachedType")
+        if isinstance(reached, str) and reached:
+            add(RATE_LIMIT_REACHED_TEXT.get(reached, reached.replace("_", " ").capitalize()))
+        if snapshot.get("spendControlReached") is True:
+            add("Spend control reached")
+    for _, snapshot in snapshots:
+        credits = snapshot.get("credits")
+        if isinstance(credits, dict):
+            if credits.get("unlimited") is True:
+                add("Credits: unlimited")
+            elif credits.get("balance"):
+                add("Credits: %s" % str(credits["balance"])[:24])
+            elif credits.get("hasCredits") is True:
+                add("Credits available")
     return notes
 
 
@@ -872,19 +896,32 @@ def codex_configured_model(config_path):
     an optimisation. codex keeps MCP server definitions in this file and on this
     fleet one of them carries a GitHub token in an `http_headers` table; a parse
     that walks the whole file could put that token one bug away from the blob
-    this script prints. A parse that cannot get past line one of the first table
-    cannot reach it however wrong the rest of this function is."""
+    this script prints.
+
+    Two more stops, because "cannot reach a credential" was measured and found
+    to be almost-but-not-quite true (PR review, 2026-09-21). A top-level
+    multi-line string can contain ANYTHING, `model = "leak"` included, and this
+    is not a TOML parser, so a line opening one ends the read rather than being
+    read into. And a value that is an inline table or an array is a STRUCTURE --
+    `model = { id = "a", token = "..." }` was returned verbatim and printed in
+    the menu -- where the only thing wanted here is a model name, so anything
+    that is not a plain scalar is refused. Between the three stops the parse
+    reads top-level scalars and nothing else."""
     try:
         for raw in config_path.read_text().splitlines():
             line = raw.strip()
             if line.startswith("["):
                 return None                      # the tables begin; stop reading
+            if '"""' in line or "\'\'\'" in line:
+                return None                      # a multi-line string begins
             if line.startswith("#") or "=" not in line:
                 continue
             key, _, value = line.partition("=")
             if key.strip() != "model":
                 continue
             value = value.strip().split("#")[0].strip()
+            if value[:1] in ("{", "["):
+                return None                      # a structure, not a name
             return value.strip("\"'") or None
     except Exception:
         pass
@@ -941,7 +978,8 @@ def codex_fetch(binary):
         # "background usage polls", which is exactly what this is.
         2: ("account/rateLimits/read", {"excludeResetCreditDetails": True}),
     }
-    if os.environ.get("CLAUDE_METER_CODEX_MODELS", "1") != "0":
+    want_models = os.environ.get("CLAUDE_METER_CODEX_MODELS", "1") != "0"
+    if want_models:
         calls[3] = ("model/list", {})
     answers = codex_app_server(binary, calls)
     if answers is None:
@@ -961,8 +999,15 @@ def codex_fetch(binary):
         account = {}
     # The model half is optional in both directions: a model/list that failed
     # must cost the section its model rows, never its numbers.
-    model, available = codex_models(answers.get(3),
-                                    codex_configured_model(CODEX_HOME / "config.toml"))
+    #
+    # CLAUDE_METER_CODEX_MODELS=0 has to reach the CONFIG read as well as the
+    # call, and that is the whole point of the flag rather than a detail: it is
+    # the only switch a user has over the one security-relevant file this
+    # collector opens, and it did not turn it off (PR review, 2026-09-21).
+    model, available = "", []
+    if want_models:
+        model, available = codex_models(
+            answers.get(3), codex_configured_model(CODEX_HOME / "config.toml"))
     return {"email": account.get("email") or "",
             "plan": rate_limits.get("planType") or account.get("planType") or "",
             "model": model, "models": available,

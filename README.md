@@ -79,9 +79,10 @@ off by a slightly wider gap. Claude alone is three bars; Claude and Codex, four.
 - A bar is blue, purple, teal, indigo or green by series, so windows sitting at
   similar low percentages can still be told apart. At 75% or a `warning`
   severity it turns orange; at 90% or `critical`, red.
-- The item never gets **wider** as tools are added: at five bars the stack
-  tightens by a tenth rather than the item growing, so nothing else in the menu
-  bar moves.
+- The item never gets **wider** as tools are added, so nothing else in the
+  menu bar moves; the stack gets denser instead. On a 22 pt menu bar, three
+  bars are the geometry this meter has always drawn, unscaled; a fourth costs
+  3.5% of the bar's thickness and a fifth costs a quarter of it.
 - A **dot at the top-right of the glyph** is the meter's own health, never a
   limit: yellow means the data being shown is more than 45 minutes old (or that
   nothing has been collected yet), red means the collector itself is failing —
@@ -127,7 +128,7 @@ gui/$(id -u)/com.ayushsharma.claude-meter`) or uninstall.
 | Claude alone | Claude + Codex | Codex hot | Five bars |
 |---|---|---|---|
 | ![three bars](docs/menu-bar/glyph-claude-only.png) | ![four bars](docs/menu-bar/glyph-claude-and-codex.png) | ![four bars, the last one red](docs/menu-bar/glyph-codex-hot.png) | ![five bars](docs/menu-bar/glyph-five-bars.png) |
-| Session, week, per-model cap — unchanged | a fourth bar, Codex's worst window, after a wider gap (here at 0%, so an empty track) | the fourth bar red, and the number beside it reads `cdx 96%` | the geometry at five, from a fixture: the stack tightens, the item does not widen |
+| Session, week, per-model cap — unchanged, 2.600 pt bars | a fourth bar, Codex's worst window, after a wider gap (here at 0%, so an empty track); 2.508 pt | the fourth bar red, and the number beside it reads `cdx 96%` | the geometry at five, from a fixture: 1.956 pt bars, and the item is still 16 pt wide |
 
 Captured from the running app at 2x and cropped to the glyph. The item is 16 pt
 wide in all four.
@@ -489,9 +490,11 @@ the question Codex's own UI asks.
 - **`config/read` is never called**, and that is a security decision rather
   than a taste one: it returns the whole effective config, `mcp_servers` and
   their headers included, and those headers can carry an API token. The one
-  value needed is taken by parsing **only** the top-level keys of `config.toml`,
-  stopping dead at the first `[table]` header, so the parse cannot reach a
-  credential even in principle.
+  value needed is taken by a reader that stops at the first `[table]` header,
+  at the first line that opens a multi-line string, and at any value that is an
+  inline table or an array — so it reads top-level scalars and nothing else.
+  `CLAUDE_METER_CODEX_MODELS=0` turns that read off along with `model/list`;
+  the fixtures cover all four stops.
 
 #### What the plans get — OpenAI's published limits
 

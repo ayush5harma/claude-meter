@@ -297,10 +297,14 @@ func barsGlyph(_ limits: [Limit], groupAfter: Int = 0, badge: NSColor? = nil) ->
     // A wider gap after Claude's block, so five lines read as two groups rather
     // than as a run of five.
     let groupGap: CGFloat = (groupAfter > 0 && groupAfter < count) ? 1.6 : 0
-    // The item never gets wider; the stack gets denser. Three bars keep exactly
-    // the geometry this meter has always drawn (2.6 pt bars, 2.2 pt gaps, a
-    // 12.2 pt stack), four fit at full thickness because the menu bar is taller
-    // than that, and only at five does anything shrink -- and then by a tenth.
+    // The item never gets wider; the stack gets denser. Measured on this Mac,
+    // whose menu bar reports 22 pt: three bars are EXACTLY the geometry this
+    // meter has always drawn (2.600 pt bars, 2.200 pt gaps, a 12.2 pt stack,
+    // unscaled); a fourth costs 3.5% of the bar's thickness (2.508 pt) and a
+    // fifth costs a quarter of it (1.956 pt), which at 2x is still four solid
+    // pixels of colour. The first draft of this comment said "four at full
+    // thickness, five shrinks by a tenth" and both figures were wrong -- they
+    // were reasoned from a 24 pt bar that this Mac does not have.
     var barHeight: CGFloat = 2.6, gap: CGFloat = 2.2
     let bars = barHeight * CGFloat(count) + gap * CGFloat(count - 1)
     let maxStack = max(12.2, menuBarHeight - 4)
@@ -498,13 +502,13 @@ final class UsageView: NSView {
             attributes[.paragraphStyle] = paragraph
         }
         let text = NSAttributedString(string: s, attributes: attributes)
-        let size = text.size()
+        let drawn = text.size()          // not `size`: that is this function's font size
         guard let maxWidth else {
-            text.draw(at: NSPoint(x: rightAligned ? x - size.width : x, y: y - size.height / 2))
+            text.draw(at: NSPoint(x: rightAligned ? x - drawn.width : x, y: y - drawn.height / 2))
             return
         }
-        text.draw(in: NSRect(x: rightAligned ? x - maxWidth : x, y: y - size.height / 2,
-                             width: maxWidth, height: size.height))
+        text.draw(in: NSRect(x: rightAligned ? x - maxWidth : x, y: y - drawn.height / 2,
+                             width: maxWidth, height: drawn.height))
     }
 
     // The graph's small grey captions: the axis ticks and the span label, each

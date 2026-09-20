@@ -1,0 +1,67 @@
+{
+ "account/read": {
+  "account": {
+   "type": "chatgpt",
+   "email": "someone@example.com",
+   "planType": "pro"
+  },
+  "requiresOpenaiAuth": true
+ },
+ "account/rateLimits/read": {
+  "ordinaryUsageAllowed": true,
+  "accountId": "fixture",
+  "rateLimits": {
+   "limitId": "codex",
+   "limitName": null,
+   "primary": {
+    "usedPercent": 42,
+    "windowDurationMins": 300,
+    "resetsAt": 1790011220
+   },
+   "secondary": {
+    "usedPercent": 7,
+    "windowDurationMins": 10080,
+    "resetsAt": 1790230400
+   },
+   "planType": "pro",
+   "credits": {
+    "hasCredits": true,
+    "unlimited": false,
+    "balance": "1,250"
+   },
+   "individualLimit": null,
+   "spendControlReached": false,
+   "rateLimitReachedType": null
+  },
+  "rateLimitsByLimitId": {
+   "codex": {
+    "limitId": "codex",
+    "limitName": null,
+    "primary": {
+     "usedPercent": 42,
+     "windowDurationMins": 300,
+     "resetsAt": 1790011220
+    },
+    "secondary": {
+     "usedPercent": 7,
+     "windowDurationMins": 10080,
+     "resetsAt": 1790230400
+    },
+    "planType": "pro",
+    "credits": {
+     "hasCredits": true,
+     "unlimited": false,
+     "balance": "1,250"
+    },
+    "individualLimit": null,
+    "spendControlReached": false,
+    "rateLimitReachedType": null
+   }
+  },
+  "rateLimitResetCredits": {
+   "availableCount": 2,
+   "credits": null
+  },
+  "rateLimitUpsell": null
+ }
+}
