@@ -1,4 +1,4 @@
-// Claude Meter — one menu-bar item showing the Claude account's real rate-limit
+// Usage Meter — one menu-bar item showing the Claude account's real rate-limit
 // utilisation: the 5-hour session window, the weekly all-models window and the
 // weekly premium-model ("scoped") window, each against its real ceiling.
 //
@@ -46,13 +46,13 @@
 // contributes one line rather than a section that could only ever say "no
 // data". The collector decides which; this file draws what it is given.
 //
-// IT COLLECTS NO DATA ITSELF. bin/claude-meter-stats emits the JSON.
+// IT COLLECTS NO DATA ITSELF. bin/usage-meter-stats emits the JSON.
 
 import AppKit
 
 // MARK: - CLI mode — run a command under this app's identity
 //
-// `ClaudeMeter --run <program> [args…]` runs the program as a CHILD of this
+// `UsageMeter --run <program> [args…]` runs the program as a CHILD of this
 // binary and waits for it. The point is macOS's per-app privacy model: TCC
 // grants (Full Disk Access, Files and Folders, Automation) are keyed to the
 // RESPONSIBLE process, and a launchd job's responsible process is its own
@@ -71,7 +71,7 @@ import AppKit
 var cliChild: Process?
 func runUnderThisIdentity(_ argv: [String]) -> Never {
     guard let program = argv.first, !program.isEmpty else {
-        FileHandle.standardError.write(Data("usage: ClaudeMeter --run <program> [args…]\n".utf8))
+        FileHandle.standardError.write(Data("usage: UsageMeter --run <program> [args…]\n".utf8))
         exit(64)
     }
     let child = Process()
@@ -86,7 +86,7 @@ func runUnderThisIdentity(_ argv: [String]) -> Never {
     signal(SIGTERM) { _ in cliChild?.terminate() }
     signal(SIGINT) { _ in cliChild?.interrupt() }
     do { try child.run() } catch {
-        FileHandle.standardError.write(Data("ClaudeMeter: cannot run \(program): \(error)\n".utf8))
+        FileHandle.standardError.write(Data("UsageMeter: cannot run \(program): \(error)\n".utf8))
         exit(126)
     }
     child.waitUntilExit()
@@ -100,10 +100,12 @@ if cliArgs.first == "--run" { runUnderThisIdentity(Array(cliArgs.dropFirst())) }
 // MARK: - Paths
 
 // The collector's cache directory, the only place outside the collector this
-// app reads. It does NOT follow CLAUDE_METER_CACHE_DIR, which the collector
+// app reads. It does NOT follow USAGE_METER_CACHE_DIR, which the collector
 // does: point that elsewhere and the dropdown's history graph goes empty.
+// The collector migrates ~/.cache/claude-meter to this path on its first run
+// after the rename, so the app only ever needs to know the new one.
 let cacheDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".cache/claude-meter")
+    .appendingPathComponent(".cache/usage-meter")
 
 // MARK: - Model
 
@@ -543,13 +545,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // can be tested without installing, then the two usual bin directories.
     private static var collectorCandidates: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let environment = ProcessInfo.processInfo.environment
         var candidates: [String] = []
-        if let fromEnv = ProcessInfo.processInfo.environment["CLAUDE_METER_STATS"], !fromEnv.isEmpty {
-            candidates.append(fromEnv)
+        // Both spellings, new first, for one release: a config-management run
+        // pins a commit and deploys the OLD path, so the app has to find it
+        // there until that run moves. Same reason bin/ still carries a shim.
+        for name in ["USAGE_METER_STATS", "CLAUDE_METER_STATS"] {
+            if let fromEnv = environment[name], !fromEnv.isEmpty { candidates.append(fromEnv) }
         }
-        candidates.append("\(home)/.local/bin/claude-meter-stats")
-        candidates.append("/usr/local/bin/claude-meter-stats")
-        candidates.append("/opt/homebrew/bin/claude-meter-stats")
+        for directory in ["\(home)/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+            candidates.append("\(directory)/usage-meter-stats")
+            candidates.append("\(directory)/claude-meter-stats")
+        }
         return candidates
     }
 
@@ -592,11 +599,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // status item in the menu bar and everything appears twice. Each
         // instance draws its own item, so this is not a rendering bug and
         // cannot be fixed by drawing; the duplicate process has to go.
+        // The OLD bundle id is swept too, and that is the rename's own hazard
+        // rather than tidiness: the previous app is a DIFFERENT application to
+        // LaunchServices, so without this a Mac mid-upgrade shows two menu-bar
+        // items, each convinced it is the only one.
         let me = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.ayushsharma.claude-meter")
-            .filter { $0.processIdentifier != me }
-        for other in others { other.terminate() }
+        let identities = [Bundle.main.bundleIdentifier ?? "local.ayushsharma.usage-meter",
+                          "local.ayushsharma.claude-meter"]
+        for identity in Set(identities) {
+            for other in NSRunningApplication.runningApplications(withBundleIdentifier: identity)
+            where other.processIdentifier != me {
+                other.terminate()
+            }
+        }
 
         collectorPath = Self.collectorCandidates.first {
             FileManager.default.isExecutableFile(atPath: $0)
@@ -628,7 +643,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         guard !collectorPath.isEmpty else {
-            lastError = "claude-meter-stats not found"
+            lastError = "usage-meter-stats not found"
             failStreak += 1
             render()
             return
@@ -854,7 +869,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addAction(menu, "Refresh Now", #selector(doRefresh), key: "r")
         menu.addItem(.separator())
-        addAction(menu, "Quit Claude Meter", #selector(quit), key: "q")
+        addAction(menu, "Quit Usage Meter", #selector(quit), key: "q")
     }
 
     // One section per other agentic CLI the collector reported on. Nothing is

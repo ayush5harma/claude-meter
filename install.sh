@@ -1,36 +1,37 @@
 #!/usr/bin/env bash
-# Install Claude Meter for the current user: build the app into /Applications,
+# Install Usage Meter for the current user: build the app into /Applications,
 # put the collector on PATH, and load the launchd agent that keeps the menu-bar
 # item running.
 #
 # Everything it touches belongs to this user -- no sudo, no system directories,
 # nothing outside /Applications, ~/.local/bin, ~/Library/LaunchAgents and
-# ~/.cache/claude-meter -- and --uninstall removes exactly those.
+# ~/.cache/usage-meter -- and --uninstall removes exactly those.
 #
 # Usage:
 #   bash install.sh [--force]        build (or rebuild) and load the agent
 #   bash install.sh --uninstall      unload the agent and remove what was installed
 #   bash install.sh --uninstall --purge   also delete the cache and usage history
+#   bash install.sh --uninstall-legacy    retire the pre-rename "Claude Meter"
 #
 # Overrides (same names build.sh uses, so the two agree):
 #   APP_DIR      directory the bundle is installed into (default /Applications)
-#   APP_NAME     bundle name without .app (default "Claude Meter")
-#   BIN_DIR      where claude-meter-stats is installed (default ~/.local/bin)
-#   AGENT_LABEL  launchd label (default com.ayushsharma.claude-meter)
+#   APP_NAME     bundle name without .app (default "Usage Meter")
+#   BIN_DIR      where usage-meter-stats is installed (default ~/.local/bin)
+#   AGENT_LABEL  launchd label (default com.ayushsharma.usage-meter)
 
 set -uo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-APP_NAME="${APP_NAME:-Claude Meter}"
+APP_NAME="${APP_NAME:-Usage Meter}"
 APPS_DIR="${APP_DIR:-/Applications}"
 BUNDLE="$APPS_DIR/${APP_NAME}.app"
-APP_BIN="$BUNDLE/Contents/MacOS/ClaudeMeter"
+APP_BIN="$BUNDLE/Contents/MacOS/UsageMeter"
 BIN_DIR="${BIN_DIR:-$HOME/.local/bin}"
-STATS="$BIN_DIR/claude-meter-stats"
-AGENT_LABEL="${AGENT_LABEL:-com.ayushsharma.claude-meter}"
+STATS="$BIN_DIR/usage-meter-stats"
+AGENT_LABEL="${AGENT_LABEL:-com.ayushsharma.usage-meter}"
 PLIST="$HOME/Library/LaunchAgents/${AGENT_LABEL}.plist"
-CACHE_DIR="${CLAUDE_METER_CACHE_DIR:-$HOME/.cache/claude-meter}"
-LOG="$CACHE_DIR/claude-meter.launchd.log"
+CACHE_DIR="${USAGE_METER_CACHE_DIR:-$HOME/.cache/usage-meter}"
+LOG="$CACHE_DIR/usage-meter.launchd.log"
 DOMAIN="gui/$(id -u)"
 
 say() { printf '  %s\n' "$*"; }
@@ -48,6 +49,7 @@ PURGE=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --uninstall) MODE=uninstall ;;
+    --uninstall-legacy) MODE=uninstall-legacy ;;
     --purge) PURGE=1 ;;
     --force) FORCE="--force" ;;
     -h|--help) usage; exit 0 ;;
@@ -55,6 +57,34 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# ── The pre-rename install ──────────────────────────────────────────────────
+# This app was "Claude Meter" until 2026-09-21. Installing the new one does NOT
+# silently delete the old one: an installed application is the user's, and a
+# rename is not a licence to remove things behind their back. It is named, and
+# retired on request.
+#
+# It holds NO privacy grant to lose -- verified against the system TCC database
+# on 2026-09-21, where a query for its bundle id returned no rows out of 65 --
+# so nothing has to be re-granted afterwards.
+LEGACY_LABEL="com.ayushsharma.claude-meter"
+LEGACY_APP="$APP_DIR/Claude Meter.app"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+LEGACY_STATS="$BIN_DIR/claude-meter-stats"
+
+uninstall_legacy() {
+  launchctl bootout "$DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1 \
+    && say "unloaded $LEGACY_LABEL" || say "$LEGACY_LABEL was not loaded"
+  # A SYMLINK here is the compatibility alias this build made and may be
+  # removed freely; a real directory is the old application itself, which is
+  # also what this was asked to retire. Both go, nothing else does.
+  for path in "$LEGACY_APP" "$LEGACY_PLIST" "$LEGACY_STATS"; do
+    if [ -L "$path" ] || [ -e "$path" ]; then
+      rm -rf "$path" && say "removed $path"
+    fi
+  done
+  say "the cache moved itself to $CACHE_DIR on the first run of the new collector"
+}
 
 unload_agent() {
   # bootout returns non-zero when the label is not loaded, which is the normal
@@ -66,16 +96,16 @@ unload_agent() {
 
 # The cache holds the API answer, the backoff stamp, the usage history and a
 # reading per other agentic CLI the collector found, so it goes only when asked
-# for. CLAUDE_METER_CACHE_DIR is an environment variable,
+# for. USAGE_METER_CACHE_DIR is an environment variable,
 # which means it can arrive relative, or as something no uninstaller should ever
 # recurse into: this refuses anything that is not an absolute path at least two
 # levels deep AND holding at least one of this app's own files -- `rm -rf` does
 # not get the benefit of the doubt.
 #
 # The empty case never reaches here, and that is worth knowing rather than
-# assuming: CACHE_DIR is set with `${CLAUDE_METER_CACHE_DIR:-...}`, so
-# `CLAUDE_METER_CACHE_DIR= bash install.sh --uninstall --purge` falls back to the
-# real default and deletes ~/.cache/claude-meter (measured 2026-09-16, on a real
+# assuming: CACHE_DIR is set with `${USAGE_METER_CACHE_DIR:-...}`, so
+# `USAGE_METER_CACHE_DIR= bash install.sh --uninstall --purge` falls back to the
+# real default and deletes ~/.cache/usage-meter (measured 2026-09-16, on a real
 # cache). Dropping the colon would send an explicit empty value to the -z test
 # below instead; that is a behaviour change, so it is not made here.
 purge_cache() {
@@ -97,7 +127,7 @@ purge_cache() {
   # ONLY file in here, and an ownership list without it would refuse to purge a
   # directory this app alone created.
   for name in usage-api.json usage-history.csv usage-api.backoff \
-              codex-usage.json codex-usage.backoff claude-meter.launchd.log; do
+              codex-usage.json codex-usage.backoff usage-meter.launchd.log; do
     [ -e "$CACHE_DIR/$name" ] && owns=1
   done
   if [ "$owns" -eq 0 ]; then
@@ -127,6 +157,11 @@ uninstall() {
   say "uninstalled"
 }
 
+if [ "$MODE" = uninstall-legacy ]; then
+  uninstall_legacy
+  exit 0
+fi
+
 if [ "$MODE" = uninstall ]; then
   uninstall
   exit 0
@@ -141,7 +176,7 @@ fi
 
 # ── Collector ───────────────────────────────────────────────────────────────
 mkdir -p "$BIN_DIR" || exit 1
-install -m 755 "$SRC_DIR/bin/claude-meter-stats" "$STATS" || exit 1
+install -m 755 "$SRC_DIR/bin/usage-meter-stats" "$STATS" || exit 1
 say "installed $STATS"
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
@@ -163,13 +198,13 @@ mkdir -p "$CACHE_DIR" "$(dirname "$PLIST")" || exit 1
 # that Mac gets the app from its flake.
 if [ -e "$PLIST" ] && { [ -L "$PLIST" ] || [ ! -w "$PLIST" ]; }; then
   say "$PLIST is read-only or a symlink, so another tool manages this agent (a Nix flake?);"
-  say "not touching it. Uninstall that first, or leave Claude Meter to it."
+  say "not touching it. Uninstall that first, or leave Usage Meter to it."
   exit 1
 fi
 sed -e "s|__LABEL__|$AGENT_LABEL|g" \
     -e "s|__APP__|$APP_BIN|g" \
     -e "s|__LOG__|$LOG|g" \
-    "$SRC_DIR/launchd/com.ayushsharma.claude-meter.plist.template" >"$PLIST" || exit 1
+    "$SRC_DIR/launchd/com.ayushsharma.usage-meter.plist.template" >"$PLIST" || exit 1
 /usr/bin/plutil -lint "$PLIST" >/dev/null || { say "rendered plist is not valid: $PLIST"; exit 1; }
 
 # Replace, never reload: `launchctl load` is deprecated and a bootstrap over a
@@ -184,5 +219,5 @@ fi
 launchctl kickstart -k "$DOMAIN/$AGENT_LABEL" >/dev/null 2>&1 || true
 
 say "done — the meter should be in the menu bar within a few seconds"
-say "if it is not, read $LOG and run: bash $SRC_DIR/bin/claude-meter-stats"
+say "if it is not, read $LOG and run: bash $SRC_DIR/bin/usage-meter-stats"
 exit 0

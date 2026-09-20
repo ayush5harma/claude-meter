@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Build "Claude Meter.app" — the menu-bar readout — from the two Swift files in
+# Build "Usage Meter.app" — the menu-bar readout — from the two Swift files in
 # Sources/, into /Applications by default.
 #
 # NO XCODE PROJECT ON PURPOSE. Two `swiftc` invocations — one for the app, one
@@ -17,7 +17,7 @@
 #   APP_DIR=<dir> bash build.sh           # same as --out
 #
 # --out / APP_DIR is the DIRECTORY the bundle is written into (the bundle lands
-# at "<dir>/Claude Meter.app"), so a build can go to a scratch directory and
+# at "<dir>/Usage Meter.app"), so a build can go to a scratch directory and
 # never has to replace the copy a launchd agent is running. APP_NAME renames the
 # bundle. When the output directory is not the default, the script does NOT
 # restart the launchd agent — a scratch build must not take over the menu bar.
@@ -26,10 +26,10 @@ set -uo pipefail
 
 SRC_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SOURCES="$SRC_DIR/Sources"
-APP_NAME="${APP_NAME:-Claude Meter}"
+APP_NAME="${APP_NAME:-Usage Meter}"
 DEFAULT_OUT="/Applications"
 OUT_DIR="${APP_DIR:-$DEFAULT_OUT}"
-AGENT_LABEL="${AGENT_LABEL:-com.ayushsharma.claude-meter}"
+AGENT_LABEL="${AGENT_LABEL:-com.ayushsharma.usage-meter}"
 FORCE=0
 
 say() { printf '  %s\n' "$*"; }
@@ -53,7 +53,7 @@ while [ "$#" -gt 0 ]; do
 done
 
 BUNDLE="$OUT_DIR/${APP_NAME}.app"
-BIN="$BUNDLE/Contents/MacOS/ClaudeMeter"
+BIN="$BUNDLE/Contents/MacOS/UsageMeter"
 
 # A path is not a compiler: /usr/bin/swiftc is a shim that exists on every Mac
 # and fails until the Xcode Command Line Tools are installed, so the guard must
@@ -87,10 +87,10 @@ write_info_plist() {
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>Claude Meter</string>
-  <key>CFBundleDisplayName</key><string>Claude Meter</string>
-  <key>CFBundleIdentifier</key><string>local.ayushsharma.claude-meter</string>
-  <key>CFBundleExecutable</key><string>ClaudeMeter</string>
+  <key>CFBundleName</key><string>Usage Meter</string>
+  <key>CFBundleDisplayName</key><string>Usage Meter</string>
+  <key>CFBundleIdentifier</key><string>local.ayushsharma.usage-meter</string>
+  <key>CFBundleExecutable</key><string>UsageMeter</string>
   <!-- CFBundleIconFile is the pre-macOS-26 path (Resources/AppIcon.icns).
        CFBundleIconName, which points at the appearance-aware icon inside
        Assets.car, is added by build_icon only when actool produced one. -->
@@ -198,7 +198,7 @@ build_icon() {
   say "icon: AppIcon.icns (no actool — light appearance only)"
 }
 
-ICON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/claude-meter-icon.XXXXXX")"
+ICON_WORK="$(mktemp -d "${TMPDIR:-/tmp}/usage-meter-icon.XXXXXX")"
 build_icon "$ICON_WORK" || say "icon build failed — the bundle keeps the icon it had"
 rm -rf "$ICON_WORK"
 
@@ -206,12 +206,38 @@ rm -rf "$ICON_WORK"
 # a locally built tool, so a real identity buys nothing here. It runs AFTER the
 # icon lands: the signature covers Contents/Resources, so writing the icns or
 # the car afterwards would invalidate it.
+# ── Compatibility with the pre-rename names, for ONE release ────────────────
+# This app was "Claude Meter" with an executable called ClaudeMeter until
+# 2026-09-21. A config-management run pins a commit and hard-codes the path it
+# launches, so until the run that installs this has itself moved, the old
+# executable path has to resolve. Two symlinks do it: one inside the bundle so
+# `.../Usage Meter.app/Contents/MacOS/ClaudeMeter` works, and one beside it so
+# `/Applications/Claude Meter.app/...` works as well.
+#
+# Made BEFORE the signature, so the seal covers them: verified with
+# `codesign --verify --deep --strict` on a scratch bundle, which accepts a
+# symlink beside the main executable and still runs through it (2026-09-21).
+# Delete both when the deployment that needs them has moved.
+LEGACY_APP="$OUT_DIR/Claude Meter.app"
+ln -sfn "UsageMeter" "$BUNDLE/Contents/MacOS/ClaudeMeter"
+
 codesign --force --sign - "$BUNDLE" >/dev/null 2>&1 || true
 /usr/bin/xattr -cr "$BUNDLE" 2>/dev/null || true
 # Bump the bundle's mtime and re-index it. LaunchServices caches an app's icon
 # against the bundle, and a Finder window already showing the old (or blank) one
 # keeps showing it until something invalidates that cache; these two are what
 # does it without asking anyone to killall Finder.
+# A symlink, not a copy: one bundle, one identity, one thing to delete later.
+# Never over a real directory -- an existing "Claude Meter.app" is the app this
+# one replaces, and removing somebody's installed application is not a build
+# step. It is left alone and named, and `install.sh` is what retires it.
+if [ -L "$LEGACY_APP" ] || [ ! -e "$LEGACY_APP" ]; then
+  ln -sfn "${APP_NAME}.app" "$LEGACY_APP" 2>/dev/null \
+    && say "compatibility alias: $(basename "$LEGACY_APP") -> ${APP_NAME}.app"
+elif [ -d "$LEGACY_APP" ]; then
+  say "left the old $(basename "$LEGACY_APP") in place — remove it with install.sh --uninstall-legacy"
+fi
+
 touch "$BUNDLE"
 /usr/bin/mdimport "$BUNDLE" >/dev/null 2>&1 || true
 say "built $BUNDLE"

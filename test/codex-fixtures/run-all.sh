@@ -2,7 +2,7 @@
 # Drive the REAL collector against each fixture and check what it emits.
 #
 # These are not unit tests and there is no framework: each case runs
-# bin/claude-meter-stats as the menu-bar app runs it, with a `codex` on PATH
+# bin/usage-meter-stats as the menu-bar app runs it, with a `codex` on PATH
 # that serves a fixture over the real app-server protocol, and asserts the JSON
 # that came out. The point is the paid-plan shapes -- a rolling 5-hour window
 # with a weekly one beside it, several metered buckets, credits, a ceiling
@@ -17,7 +17,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
-COLLECTOR="$REPO/bin/claude-meter-stats"
+COLLECTOR="$REPO/bin/usage-meter-stats"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -41,7 +41,7 @@ collect() {
   HOME="$WORK/home" \
   CODEX_HOME="$WORK/home/.codex" \
   GEMINI_HOME="${GEMINI_HOME:-$WORK/no-gemini}" \
-  CLAUDE_METER_CACHE_DIR="$WORK/cache-$2" \
+  USAGE_METER_CACHE_DIR="$WORK/cache-$2" \
     bash "$COLLECTOR"
 }
 
@@ -127,7 +127,7 @@ check "structure not in blob" "$(printf '%s' "$out" | grep -c ghp_NOTATOKEN || t
 
 cfg 'model = "gpt-5.6-luna"
 '
-out="$(CLAUDE_METER_CODEX_MODELS=0 collect "$HERE/paid-two-windows.json" cfg5)"
+out="$(USAGE_METER_CODEX_MODELS=0 collect "$HERE/paid-two-windows.json" cfg5)"
 check "MODELS=0 drops rows"  "$(printf '%s' "$out" | field '["details"]')" "['Credits: 1,250']"
 check "MODELS=0 keeps bars"  "$(printf '%s' "$out" | field '["limits"].__len__()')" "2"
 : >"$WORK/home/.codex/config.toml"
@@ -163,7 +163,7 @@ check "invents no number" "$(printf '%s' "$out" | field '.get("limits", [])')" "
 
 say "absence — no codex home, so no codex key at all"
 out="$(CODEX_HOME="$WORK/nothing-here" PATH="$WORK/bin:/usr/bin:/bin" HOME="$WORK/home" \
-       CLAUDE_METER_CACHE_DIR="$WORK/cache-absent" bash "$COLLECTOR")"
+       USAGE_METER_CACHE_DIR="$WORK/cache-absent" bash "$COLLECTOR")"
 check "no codex key"      "$(printf '%s' "$out" | python3 -c 'import json,sys; print("codex" in json.loads(sys.stdin.read()))')" "False"
 check "claude key stays"  "$(printf '%s' "$out" | python3 -c 'import json,sys; print("claude" in json.loads(sys.stdin.read()))')" "True"
 

@@ -1,4 +1,4 @@
-// Draws "Claude Meter"'s app icon FROM CODE, at build time. No binary asset is
+// Draws "Usage Meter"'s app icon FROM CODE, at build time. No binary asset is
 // checked in: build.sh compiles this file, runs it, and feeds what it writes to
 // actool/iconutil. A .png in the repo would be a blob nobody can diff and that
 // nothing regenerates; a hundred lines of CoreGraphics is reviewable and edits

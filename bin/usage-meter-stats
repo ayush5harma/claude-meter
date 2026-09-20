@@ -1,0 +1,1275 @@
+#!/usr/bin/env bash
+# Emit ONE JSON blob for the "Usage Meter" menu-bar app: the Claude account's
+# real rate-limit utilisation, plus a section per OTHER agentic CLI installed on
+# this Mac that can report its own quota locally.
+#
+# PRESENCE-GATED, ALWAYS. A tool that is not installed contributes no key at
+# all, so the blob carries the same keys and the same values it carried before
+# that tool was supported, and the menu drawn from it is identical row for row.
+# (The blob is not byte-identical: `ts` and the outer object are now serialised
+# by the same json.dumps as everything else, which spaces them. Nothing reads
+# this as text.) Nothing prints an empty row or an error for a binary nobody
+# has.
+#
+# THE NUMBERS ARE REAL, NOT DERIVED. Claude Code caches the account's actual
+# rate-limit utilisation -- what `/usage` shows -- in `cachedUsageUtilization`
+# in its config file, and the same numbers are served live by the OAuth usage
+# endpoint. Three limits live in `utilization.limits[]`, each with a `percent`,
+# a `resets_at` and a `severity`:
+#   kind=session        the 5-hour window
+#   kind=weekly_all     the weekly limit across all models
+#   kind=weekly_scoped  the weekly limit for premium models
+# Token counts without a denominator are noise, which is what this replaced.
+#
+# SEVERAL IDENTITIES. One Mac can hold more than one Claude Code identity, each
+# in its own config directory (the default ~/.claude, plus anything pointed at
+# by CLAUDE_CONFIG_DIR), and each caches its OWN account's utilisation. All of
+# them are read, and ONE is shown: the identity with the newest LIVE session
+# (Claude Code's registry <config dir>/sessions/<pid>.json, `updatedAt`, pid
+# still alive), the freshest cachedUsageUtilization breaking a tie. An identity
+# WITHOUT that cache is still a candidate: right after a /login the new account
+# has none, and skipping it made the meter wear the other identity's stale
+# account for hours (fixed 2026-09-09). The live API answer is cached per
+# identity AND per email, so a switched account never shows the previous one's
+# numbers. The age of whatever is shown is reported -- a number nobody has
+# refreshed is never presented as current.
+#
+# FAST AND SILENT: a couple of JSON reads plus, at most once per TTL, one
+# bounded HTTPS call. No tokens are ever printed, logged or put in argv.
+#
+# Renamed from claude-meter-stats on 2026-09-21, when the app became Usage
+# Meter. EVERY OLD NAME STILL WORKS for one release: bin/claude-meter-stats is a
+# shim that execs this, every USAGE_METER_* variable falls back to its
+# CLAUDE_METER_* spelling, and ~/.cache/claude-meter is moved to
+# ~/.cache/usage-meter the first time this runs. The reason is not politeness:
+# a config-management run pins a commit and deploys the old path, so the two
+# names have to overlap by at least the release that moves them.
+#
+# Environment (each also accepted under its old CLAUDE_METER_* spelling):
+#   USAGE_METER_CONFIG_DIRS  colon-separated list of config dirs to consider,
+#                             replacing the default discovery entirely. An entry
+#                             may be "label=path" to name the identity:
+#                             "work=$HOME/.claude:personal=$HOME/.claude-personal".
+#                             A bare path keeps the directory-derived name.
+#                             Give a config dir the SAME absolute path, with no
+#                             trailing slash, that CLAUDE_CONFIG_DIR was given:
+#                             the keychain service is derived from that string,
+#                             so a different spelling of the same directory
+#                             finds no token.
+#   CLAUDE_CONFIG_DIR         Claude Code's own variable; added to the defaults
+#   USAGE_METER_CACHE_DIR    where the API cache, backoff stamp and usage
+#                             history live (default ~/.cache/usage-meter)
+#   USAGE_API_TTL             seconds; overrides the adaptive 120s/900s TTL
+#   CODEX_HOME                codex's own variable; where its state lives
+#                             (default ~/.codex). Read for PRESENCE and for the
+#                             existence of auth.json -- never for its contents.
+#   USAGE_METER_CODEX        "0" turns the codex section off entirely
+#   CODEX_USAGE_TTL           seconds; overrides the adaptive 120s/900s TTL
+#   USAGE_METER_CODEX_MODELS "0" drops the model rows, keeping the windows
+#   GEMINI_HOME               where agy keeps its state (default ~/.gemini);
+#                             read for PRESENCE only, never for its contents
+#   USAGE_METER_AGY          "0" drops the agy line entirely
+
+set -uo pipefail
+
+# A launchd-spawned shell inherits a sparse PATH, and this script needs
+# python3, security and curl from /usr/bin. Append rather than prepend, so an
+# operator's own PATH still wins.
+case ":$PATH:" in
+  *:/usr/bin:*) ;;
+  *) PATH="$PATH:/usr/bin:/bin:/usr/sbin:/sbin" ;;
+esac
+export PATH
+
+# The heredoc is deliberately NOT inside $(...): the menu-bar app runs this
+# script with /bin/bash (3.2), whose parser token-scans a heredoc inside command
+# substitution and pairs single quotes naively -- one apostrophe in a Python
+# comment then reads as an unterminated string and the whole script dies at EOF.
+# A plain heredoc redirected to a temp file parses correctly, and frees every
+# future edit from balancing apostrophes.
+py_out="$(mktemp)"
+python3 - <<'PY' >"$py_out" 2>/dev/null
+import json, pathlib, datetime, hashlib, math, os, queue, shutil, signal, subprocess, threading, time
+from collections import namedtuple
+
+HOME = pathlib.Path.home()
+DEFAULT_CONFIG_DIR = HOME / ".claude"
+
+def env(name, default=""):
+    """USAGE_METER_<name>, falling back to the CLAUDE_METER_<name> this was
+    called before the rename. The new name wins when both are set; an empty
+    value is a value, so a deliberate USAGE_METER_X="" is not overridden by a
+    stale CLAUDE_METER_X."""
+    for prefix in ("USAGE_METER_", "CLAUDE_METER_"):
+        if prefix + name in os.environ:
+            return os.environ[prefix + name]
+    return default
+
+
+CACHE_DIR = pathlib.Path(env("CACHE_DIR") or (HOME / ".cache" / "usage-meter"))
+LEGACY_CACHE_DIR = HOME / ".cache" / "claude-meter"
+
+
+def migrate_cache():
+    """Move the pre-rename cache across, once, and never over anything.
+
+    A rename that abandons the cache is not a disaster -- everything in it is
+    re-derivable -- but it throws away the usage history the graph draws, which
+    is the one thing here that cannot be re-fetched. Renaming the directory is
+    atomic and cheap; if the new one already exists this has already happened,
+    or the operator made it, and either way it is not ours to overwrite."""
+    try:
+        if LEGACY_CACHE_DIR.is_dir() and not CACHE_DIR.exists() \
+                and CACHE_DIR == HOME / ".cache" / "usage-meter":
+            CACHE_DIR.parent.mkdir(parents=True, exist_ok=True)
+            LEGACY_CACHE_DIR.rename(CACHE_DIR)
+    except Exception:
+        pass
+
+
+migrate_cache()
+API_CACHE = CACHE_DIR / "usage-api.json"
+BACKOFF = CACHE_DIR / "usage-api.backoff"
+HISTORY = CACHE_DIR / "usage-history.csv"
+
+# The three limits the app draws, keyed by the endpoint's own `kind`.
+LIMIT_KEYS = {"session": "session", "weekly_all": "weekly", "weekly_scoped": "scoped"}
+
+# Roll a PAST resets_at forward ONLY for the weekly limits: their reset is a
+# fixed schedule, so adding whole weeks states a fact. The session window is
+# NOT on a grid -- a new 5 h window anchors on first use after idle -- so rolling
+# it forward fabricated countdowns ("resets in 1h57" for a window that ended
+# hours ago). A past session reset now reports 0 and the app shows a dash.
+RESET_CADENCE = {"weekly_all": 7 * 86400, "weekly_scoped": 7 * 86400}
+
+# Why the live path is not serving, in words the dropdown can print.
+FETCH_ERROR_TEXT = {"429": "rate-limited", "token": "no valid token",
+                    "shape": "bad response", "net": "network error"}
+
+# What the scoped weekly cap applies to when the response names nothing --
+# better a generic word than a model family this script invented.
+DEFAULT_SCOPED_LABEL = "Model"
+
+# A history point is recorded only when a value CHANGES or this long has passed:
+# the session cache is flat between claude runs, so a 30 s poll would otherwise
+# write ~2880 identical rows a day for no information. The cap keeps the file to
+# a few tens of KB.
+HISTORY_MIN_INTERVAL = 600
+HISTORY_MAX_ROWS = 2000
+
+
+def write_private(path, text):
+    """Write a cache file that is 0600 from the moment it exists.
+
+    write_text() creates at the process umask and a chmod afterwards leaves a
+    window -- brief, and inside a 0700 directory, so this is order rather than
+    exposure, but there is no reason for the order to be wrong (PR review,
+    2026-09-20)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+    except Exception:
+        os.close(fd)
+        raise
+    os.chmod(path, 0o600)   # an EXISTING file keeps its old mode through O_CREAT
+
+
+def load_json(path):
+    try:
+        return json.loads(pathlib.Path(path).read_text())
+    except Exception:
+        return None
+
+
+# ── Identities ──────────────────────────────────────────────────────────────
+
+Identity = namedtuple("Identity", "config_dir label email cached_utilization cached_at")
+
+
+def parse_config_dirs_entry(spec):
+    """One USAGE_METER_CONFIG_DIRS entry: "path", or "label=path" to name the
+    identity yourself instead of taking the name from the directory.
+
+    The label form is recognised only when the part before the first "=" is a
+    bare name -- no "/" in it -- so a directory whose own name contains an "="
+    is still read as a path. Returns (path, label or None)."""
+    head, sep, tail = spec.partition("=")
+    if sep and head.strip() and "/" not in head and tail.strip():
+        return pathlib.Path(os.path.expanduser(tail.strip())), head.strip()
+    return pathlib.Path(os.path.expanduser(spec.strip())), None
+
+
+def config_dirs():
+    """Every Claude Code identity to consider, as (path, label or None), in
+    discovery order.
+
+    USAGE_METER_CONFIG_DIRS replaces the list outright, and its entries may
+    carry labels ("work=~/.claude:personal=~/.claude-personal"). Otherwise:
+    whatever CLAUDE_CONFIG_DIR names, the default ~/.claude, and any
+    ~/.claude-<name> directory that actually holds a config file (that is how a
+    second identity is kept on one Mac -- CLAUDE_CONFIG_DIR pointed at it in the
+    shell that launches it)."""
+    seen, out = set(), []
+
+    def add(path, label=None):
+        if str(path) not in seen:
+            seen.add(str(path))
+            out.append((path, label))
+
+    override = env("CONFIG_DIRS").strip()
+    if override:
+        for spec in override.split(":"):
+            if spec.strip():
+                add(*parse_config_dirs_entry(spec))
+        return out
+    for spec in os.environ.get("CLAUDE_CONFIG_DIR", "").split(":"):
+        if spec.strip():
+            add(pathlib.Path(os.path.expanduser(spec.strip())))
+    add(DEFAULT_CONFIG_DIR)
+    try:
+        for path in sorted(HOME.glob(".claude-*")):
+            if path.is_dir() and (path / ".claude.json").exists():
+                add(path)
+    except Exception:
+        pass
+    return out
+
+
+def label_for(config_dir, override=None):
+    """A short name for the identity, shown beside the account email. An
+    explicit label from USAGE_METER_CONFIG_DIRS wins: the name is what a
+    person recognises the account by, and the directory it happens to live in
+    need not say it."""
+    if override:
+        return override
+    if config_dir == DEFAULT_CONFIG_DIR:
+        return "default"
+    name = config_dir.name.lstrip(".")
+    if name.startswith("claude-"):
+        name = name[len("claude-"):]
+    return name or str(config_dir)
+
+
+def config_file(config_dir):
+    """Claude Code keeps the DEFAULT identity's config beside its state
+    directory (~/.claude.json, not ~/.claude/.claude.json); a custom
+    CLAUDE_CONFIG_DIR holds both. Prefer whichever actually exists."""
+    candidates = [config_dir / ".claude.json"]
+    if config_dir == DEFAULT_CONFIG_DIR:
+        candidates.insert(0, HOME / ".claude.json")
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
+
+
+def newest_live_session(config_dir):
+    """Newest updatedAt (seconds) among this identity's LIVE sessions, read from
+    the registry Claude Code keeps in <config dir>/sessions/<pid>.json; 0 when
+    the identity has no live session."""
+    newest = 0.0
+    try:
+        for path in (config_dir / "sessions").glob("*.json"):
+            try:
+                session = json.loads(path.read_text())
+                pid = int(session.get("pid") or 0)
+                if pid <= 0:
+                    continue
+                os.kill(pid, 0)    # raises when the process is gone
+                newest = max(newest, (session.get("updatedAt") or session.get("startedAt") or 0) / 1000)
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return newest
+
+
+def pick_identity():
+    """The one identity to show, or None when nothing is known about any of
+    them: the newest live session wins, the freshest cachedUsageUtilization
+    only breaks a tie."""
+    best, best_rank = None, None
+    for config_dir, label_override in config_dirs():
+        config = load_json(config_file(config_dir))
+        if not isinstance(config, dict):
+            continue
+        cached = config.get("cachedUsageUtilization")
+        if not isinstance(cached, dict):
+            cached = {}
+        email = (config.get("oauthAccount") or {}).get("emailAddress") or ""
+        if not cached and not email:
+            continue      # nothing known about this identity
+        rank = (newest_live_session(config_dir), (cached.get("fetchedAtMs") or 0) / 1000)
+        if best_rank is None or rank > best_rank:
+            best_rank = rank
+            best = Identity(config_dir, label_for(config_dir, label_override), email,
+                            cached.get("utilization") or {}, rank[1])
+    return best
+
+
+# ── The live usage endpoint ─────────────────────────────────────────────────
+#
+# `cachedUsageUtilization` is only rewritten while claude runs, so reading it
+# alone left the menu bar as fresh as the last session (5 h stale, with an
+# already-expired session window). /usage GETs this endpoint with the profile's
+# OAuth token and the response carries the SAME limits[] shape, so this calls
+# it too.
+#
+# THE ENDPOINT RATE-LIMITS. A 25 s TTL while claude ran is ~120 requests/hour
+# against the app's 30 s poll: the endpoint answered 429 and STAYED 429 because
+# every poll retried instantly, and the meter fell back to the file cache
+# forever while looking live (2026-09-01: 30% shown from a 3 h-old cache while
+# the last good API answer, 7 minutes earlier, said 46%). Limits move slowly, so
+# one call per TTL -- ~30 requests/hour -- is plenty current and far below the
+# threshold, and any failure parks the network path for a while afterwards.
+
+API_URL = "https://api.anthropic.com/api/oauth/usage"
+TTL_WHILE_CLAUDE_RUNS = 120
+TTL_WHILE_IDLE = 900
+BACKOFF_AFTER_429 = 900
+BACKOFF_AFTER_OTHER = 180
+
+
+def claude_is_running():
+    try:
+        found = subprocess.run(["pgrep", "-f", r"(^|/)claude($| )"],
+                               capture_output=True, text=True, timeout=5)
+        return found.returncode == 0 and bool(found.stdout.strip())
+    except Exception:
+        return False
+
+
+API_TTL = int(os.environ.get("USAGE_API_TTL", "0")) or \
+    (TTL_WHILE_CLAUDE_RUNS if claude_is_running() else TTL_WHILE_IDLE)
+# Sampled here, after the running-session check above, as it always was: every
+# time-derived field (age_s, reset_in, fetched_at, the history row) moves with it.
+NOW = datetime.datetime.now(datetime.timezone.utc).timestamp()
+
+
+def keychain_service(config_dir):
+    # Claude Code keys its Keychain item to the config dir: the DEFAULT dir uses
+    # the bare name, any other appends sha256(dir)[:8] (verified against a live
+    # keychain). Deriving it beats a ~160 KB `security dump-keychain` per poll
+    # and, more importantly, pins the fetch to THIS account's token -- trying
+    # every token in turn meant one identity's failure could return ANOTHER
+    # account's numbers under the first one's label.
+    #
+    # The hash is over the PATH STRING, so it is only ever as right as the
+    # spelling it is given: pass the same absolute path Claude Code was given.
+    # Nothing here resolves symlinks or rewrites the path to "fix" a mismatch --
+    # a normalisation this script invented would just be a second spelling to
+    # be wrong in, and it would fail silently as "no valid token".
+    if config_dir == DEFAULT_CONFIG_DIR:
+        return "Claude Code-credentials"
+    return "Claude Code-credentials-" + hashlib.sha256(str(config_dir).encode()).hexdigest()[:8]
+
+
+def access_token(service):
+    try:
+        raw = subprocess.run(["security", "find-generic-password", "-s", service, "-w"],
+                             capture_output=True, text=True, timeout=10).stdout.strip()
+        oauth = json.loads(raw).get("claudeAiOauth", {})
+        if oauth.get("accessToken") and oauth.get("expiresAt", 0) > time.time() * 1000:
+            return oauth["accessToken"]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_usage(config_dir):
+    """One attempt with THIS identity's token only. Returns (data, errkind)."""
+    token = access_token(keychain_service(config_dir))
+    if not token:
+        return None, "token"     # expired/absent: claude refreshes it, not us
+    try:
+        # The token reaches curl on STDIN (`--config -`), never argv and never a
+        # file: argv is world-readable through `ps`, and a temporary file -- even
+        # one created 0600 and unlinked in a finally -- still puts the token on
+        # disk, where a crash between write and unlink leaves it. A pipe exists
+        # only between these two processes and dies with them.
+        config = ('header = "Authorization: Bearer %s"\n'
+                  'header = "anthropic-beta: oauth-2025-04-20"\n'
+                  'header = "Content-Type: application/json"\n' % token)
+        answer = subprocess.run(["curl", "-sS", "--max-time", "15",
+                                 "-w", "\n%{http_code}", "--config", "-", API_URL],
+                                input=config, capture_output=True, text=True, timeout=20)
+        body, _, code = answer.stdout.rpartition("\n")
+        if code.strip() == "429":
+            return None, "429"
+        data = json.loads(body)
+        if isinstance(data, dict) and data.get("limits"):
+            return data, None
+        return None, "shape"
+    except Exception:
+        return None, "net"
+
+
+def backoff_state():
+    """(active, why, retry_in_s) from the stamp. The WHY is kept so a poll
+    during backoff can still tell the UI what actually failed -- a silent
+    fallback to the session cache is indistinguishable from freshness, which
+    is exactly the lie this meter exists not to tell."""
+    try:
+        parts = BACKOFF.read_text().split()
+        stamped_at, wait = float(parts[0]), float(parts[1])
+        why = parts[2] if len(parts) > 2 else "error"
+        left = stamped_at + wait - time.time()
+        return left > 0, why, max(0, int(left))
+    except Exception:
+        return False, "", 0
+
+
+def start_backoff(seconds, why):
+    try:
+        BACKOFF.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        BACKOFF.write_text("%d %d %s" % (time.time(), seconds, why))
+    except Exception:
+        pass
+
+
+def load_api_cache(identity):
+    # The cache records WHICH account it holds -- the identity label AND the
+    # email: on a machine where the shown identity flips, or where /login moved
+    # an identity to another account, a cached answer for a different account
+    # must read as "no cache", not as data.
+    cached = load_json(API_CACHE)
+    if isinstance(cached, dict) and cached.get("account") == identity.label \
+            and cached.get("email", "") == identity.email \
+            and isinstance(cached.get("data"), dict):
+        return cached["data"], float(cached.get("fetched_at") or 0)
+    return None, 0.0
+
+
+def save_api_cache(identity, data):
+    try:
+        # 0700/0600: this file holds the account's email address and the full
+        # usage response. Nothing here is a credential, but it is this user's
+        # data and no other account on the Mac needs it.
+        CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+        write_private(API_CACHE, json.dumps(
+            {"account": identity.label, "email": identity.email, "fetched_at": NOW, "data": data}))
+        if BACKOFF.exists():
+            BACKOFF.unlink()
+    except Exception:
+        pass
+
+
+# ── The reading to show ─────────────────────────────────────────────────────
+
+Reading = namedtuple("Reading", "utilization taken_at source fetch_error retry_in")
+
+
+def current_reading(identity):
+    """The freshest utilisation this identity has, from the API when the cache
+    is past its TTL and the network path is not parked.
+
+    FRESHEST WINS, whatever its origin: a 5-minute-old API answer beats a
+    3-hour-old session cache even when both are past their nominal TTL. The
+    first cut ignored the API cache once past TTL and regressed to the older
+    file-cache numbers."""
+    data, fetched_at = load_api_cache(identity)
+    in_backoff, fail_why, retry_in = backoff_state()
+    if (data is None or NOW - fetched_at >= API_TTL) and not in_backoff:
+        fresh, err = fetch_usage(identity.config_dir)
+        if fresh:
+            data, fetched_at = fresh, NOW
+            fail_why, retry_in = "", 0
+            save_api_cache(identity, fresh)
+        else:
+            wait = BACKOFF_AFTER_429 if err == "429" else BACKOFF_AFTER_OTHER
+            start_backoff(wait, err)
+            fail_why, retry_in = err, wait
+    if data is not None and fetched_at >= identity.cached_at:
+        return Reading(data, fetched_at, "api", fail_why, retry_in)
+    return Reading(identity.cached_utilization, identity.cached_at, "session-cache", fail_why, retry_in)
+
+
+def seconds_until_reset(iso, kind=None):
+    if not iso:
+        return 0
+    try:
+        resets_at = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+    except Exception:
+        return 0
+    left = resets_at - NOW
+    if left < 0:
+        cadence = RESET_CADENCE.get(kind or "", 0)
+        if cadence <= 0:
+            return 0
+        left += math.ceil((-left) / cadence) * cadence
+    return max(0, int(left))
+
+
+def limits_and_scoped_label(utilization):
+    """The three limits the app draws, plus what the endpoint says the scoped
+    weekly cap applies to.
+
+    THE ENDPOINT NAMES THE CAP ITSELF, so nothing here hardcodes a model family
+    that will be wrong at the next release. Inspected 2026-09-12: every limits[]
+    entry carries `scope`, null on the session and all-models limits and, on
+    weekly_scoped, {"model": {"id": null, "display_name": "<name>"},
+    "surface": null}. The flat legacy keys beside limits[] (seven_day_opus and
+    friends) were null in the same response, so they are not a second source."""
+    limits, scoped_label = {}, ""
+    for limit in (utilization.get("limits") or []):
+        kind = limit.get("kind")
+        key = LIMIT_KEYS.get(kind)
+        if not key:
+            continue
+        limits[key] = {
+            "pct": int(limit.get("percent") or 0),
+            "reset_in": seconds_until_reset(limit.get("resets_at"), kind),
+            "severity": limit.get("severity") or "normal",
+        }
+        if key == "scoped":
+            model = (limit.get("scope") or {}).get("model") or {}
+            scoped_label = (model.get("display_name") or "").strip()
+    # Fall back to the flat structure if limits[] is absent on an older client.
+    for key, flat_key, kind in (("session", "five_hour", "session"),
+                                ("weekly", "seven_day", "weekly_all")):
+        flat = utilization.get(flat_key)
+        if key not in limits and isinstance(flat, dict):
+            limits[key] = {"pct": int(flat.get("utilization") or 0),
+                           "reset_in": seconds_until_reset(flat.get("resets_at"), kind),
+                           "severity": "normal"}
+    return limits, scoped_label
+
+
+def append_history(label, limits):
+    """Append a point to the usage history the menu graphs."""
+    try:
+        HISTORY.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+        # The label is user-supplied (USAGE_METER_CONFIG_DIRS), and this is a
+        # five-field CSV parsed by position: a comma in it would shift every
+        # later field and the row would be dropped as malformed by the reader --
+        # and by the dedupe check here, which rewrites the whole file every poll.
+        row = "%d,%s,%d,%d,%d" % (int(NOW), label.replace(",", "-"),
+                                  limits.get("session", {}).get("pct", 0),
+                                  limits.get("weekly", {}).get("pct", 0),
+                                  limits.get("scoped", {}).get("pct", 0))
+        rows = HISTORY.read_text().splitlines() if HISTORY.exists() else []
+        if rows:
+            last = rows[-1].split(",")
+            unchanged = len(last) == 5 and last[1:] == row.split(",")[1:]
+            if unchanged and int(NOW) - int(last[0]) < HISTORY_MIN_INTERVAL:
+                return
+        rows.append(row)
+        HISTORY.write_text("\n".join(rows[-HISTORY_MAX_ROWS:]) + "\n")
+    except Exception:
+        pass
+
+
+# ── codex (the OpenAI Codex CLI) ────────────────────────────────────────────
+#
+# WHY NOT A FILE. codex persists no quota snapshot this can read. Measured
+# 2026-09-20 against codex-cli 0.154.0 signed in with a ChatGPT account: the
+# five sqlite databases under $CODEX_HOME hold threads, logs, goals, memories
+# and a queue and no rate-limit table between them; `codex doctor` reports
+# thirty-odd facts about the install and not one number about usage; and there
+# were no rollout files to read at all -- `codex doctor` counted "active
+# rollouts 0 files" and "rollout DB rows 0", and $CODEX_HOME/sessions did not
+# exist, because rollouts are written only while a session runs. (The 0.154.0
+# binary's symbols put `rate_limits` beside the rollout types, so a rollout of
+# a session that HAS run probably carries one -- not measured, and it would
+# still be as old as the last session either way.) Grepping the whole of
+# $CODEX_HOME for a rate-limit string found one hit, in an unrelated plugin
+# catalogue.
+#
+# WHAT IS READ INSTEAD. codex ships its own local JSON-RPC server -- `codex
+# app-server`, stdio, the same one its desktop app drives -- and three of its
+# methods are exactly this: `account/read` (plan and email, answered from
+# $CODEX_HOME alone, 0.03 s, no network), `account/rateLimits/read` (the usage
+# read, 0.79 s including its round trip) and `model/list` (the models this
+# ACCOUNT may pick, and which is the catalog default). None of the three is a
+# model request, so none spends any of the account's quota.
+#
+# `account/usage/read` is deliberately NOT asked for, though it exists and
+# answers: it returns lifetime and per-day TOKEN totals (measured 2026-09-21:
+# lifetimeTokens, peakDailyTokens, a dailyUsageBuckets array). Token counts
+# with no ceiling to divide by are exactly what the Claude side of this file
+# replaced with percentages, and showing them here would put the one thing this
+# meter refuses to show back on the screen under another tool's name.
+#
+# `config/read` is NOT asked for either, and that is a security decision rather
+# than a taste one: it returns the whole effective config, `mcp_servers` and
+# their headers included, and on this fleet those headers carry a GitHub token.
+# The one config value needed -- which model a bare `codex` would run -- is
+# taken by parsing ONLY the top-level keys of config.toml, stopping dead at the
+# first `[table]` header, so the parse cannot reach a credential even in
+# principle. See codex_configured_model.
+#
+# THE CREDENTIAL STAYS CODEX'S. $CODEX_HOME/auth.json holds the account's
+# OAuth tokens and NOTHING here opens it: presence is `auth.json` existing, and
+# the tokens are used by the app-server, in its own process, as codex already
+# does for itself. That is the whole reason this goes through the app-server
+# rather than calling `chatgpt.com/backend-api/codex/usage` with a token of our
+# own, which would have been the shorter path and the wrong one.
+
+CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
+CODEX_CACHE = CACHE_DIR / "codex-usage.json"
+# Bumped whenever a reading gains a field the app draws. A cache written by an
+# older collector is then simply not a cache, and the next poll refetches once
+# instead of serving a reading with the new rows missing for up to a TTL --
+# which is exactly what an upgraded collector did on this Mac before the gate
+# existed: correct numbers, no model rows, for fifteen minutes, and nothing on
+# screen to say why (measured 2026-09-21).
+CODEX_CACHE_VERSION = 2
+CODEX_BACKOFF = CACHE_DIR / "codex-usage.backoff"
+
+# Where a `codex` binary may be, after PATH. A launchd-spawned shell inherits a
+# sparse PATH -- this script seeds /usr/bin and friends into it at the top, and
+# that is enough for python3 and curl but not for a CLI installed anywhere
+# else -- so PATH alone made an installed codex invisible to the resident
+# meter while it was plainly on the developer's own $PATH. Same "first
+# executable wins" shape the app uses to find this collector.
+CODEX_BIN_DIRS = ("~/.local/bin", "/run/current-system/sw/bin",
+                  "/etc/profiles/per-user/%s/bin" % os.environ.get("USER", ""),
+                  "~/.nix-profile/bin", "/opt/homebrew/bin", "/usr/local/bin")
+
+CODEX_TTL_WHILE_RUNNING = 120
+CODEX_TTL_WHILE_IDLE = 900
+CODEX_BACKOFF_SECONDS = 180
+
+# The app-server answers in under a second (measured 0.79 s for the usage read,
+# 0.03 s for the account read, 2026-09-20). Ten seconds is a bound on something
+# wedged, not a budget: the app's own watchdog has to cover this on top of the
+# Claude path's 15 s curl, and both only run once per TTL.
+CODEX_CALL_TIMEOUT = 10
+
+CODEX_FETCH_ERROR_TEXT = {"spawn": "codex would not start", "timeout": "codex did not answer",
+                          "shape": "bad response", "rpc": "codex refused the request"}
+
+
+def codex_binary():
+    """The codex executable, or None when this Mac has none."""
+    found = shutil.which("codex")
+    if found:
+        return found
+    for directory in CODEX_BIN_DIRS:
+        candidate = pathlib.Path(os.path.expanduser(directory)) / "codex"
+        if os.access(str(candidate), os.X_OK) and candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def codex_app_server(binary, calls):
+    """Ask a fresh `codex app-server` for each of `calls` ({id: (method, params)})
+    and return {id: result}, missing an id whose call failed.
+
+    Spawn-and-kill on purpose: the server is ephemeral unless a daemon is asked
+    for, it left no process and wrote no file in the probe this was built from,
+    and a meter must not be the thing that starts a resident server nobody asked
+    for. Every read is under one deadline, and the whole process GROUP is killed
+    in `finally` whatever happens, so a hung server cannot outlive the poll that
+    made it.
+
+    The group, not the child, and that is not caution: killing the direct child
+    alone was measured leaving an orphan behind (PR review, 2026-09-20). A
+    `codex` that is a WRAPPER SCRIPT -- which the npm and Homebrew installs this
+    searches for can be, even though the binary on the machine this was built on
+    is a Mach-O -- launches the real server as a grandchild, and `kill` on the
+    wrapper reparents it to PID 1 still running. `start_new_session` puts the
+    whole thing in a group of its own so one signal ends it."""
+    try:
+        server = subprocess.Popen([binary, "app-server"],
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                                  start_new_session=True)
+    except Exception:
+        return None
+    lines, answers, never_started = queue.Queue(), {}, False
+
+    def read_lines():
+        try:
+            for line in server.stdout:
+                lines.put(line)
+        except Exception:
+            pass
+        lines.put(None)
+
+    threading.Thread(target=read_lines, daemon=True).start()
+    try:
+        # initialize, then the notification that the handshake is done, then
+        # every request at once -- the server answers them independently and
+        # nothing here depends on their order.
+        server.stdin.write(json.dumps({
+            "jsonrpc": "2.0", "id": 0, "method": "initialize",
+            "params": {"clientInfo": {"name": "usage-meter", "version": "1"}}}) + "\n")
+        server.stdin.write(json.dumps({"jsonrpc": "2.0", "method": "initialized", "params": {}}) + "\n")
+        for call_id, (method, params) in calls.items():
+            server.stdin.write(json.dumps({"jsonrpc": "2.0", "id": call_id,
+                                           "method": method, "params": params}) + "\n")
+        server.stdin.flush()
+        deadline = time.time() + CODEX_CALL_TIMEOUT
+        while len(answers) < len(calls):
+            left = deadline - time.time()
+            if left <= 0:
+                break
+            try:
+                line = lines.get(timeout=left)
+            except Exception:
+                break
+            if line is None:
+                break          # the server closed its output
+            try:
+                message = json.loads(line)
+            except Exception:
+                continue       # a notification we did not ask for, or a partial line
+            call_id = message.get("id")
+            if call_id in calls and "result" in message:
+                answers[call_id] = message["result"]
+            elif call_id in calls:
+                answers[call_id] = None    # an error reply: recorded as a miss, not a hang
+    except BrokenPipeError:
+        # The server was gone before it read the handshake: a codex too old to
+        # have `app-server`, or something on PATH named codex that is not codex.
+        # That is a failure to START, and saying so is the difference between
+        # "upgrade codex" and "something is wedged".
+        never_started = True
+    except Exception:
+        pass
+    finally:
+        # Asked BEFORE the kill below, or every run would look like an exit. A
+        # child that ended on its OWN without answering did not start, whatever
+        # the pipe did -- the handshake is ~400 bytes and lands in the buffer
+        # before a fast-exiting child is reaped, so that write succeeds and
+        # BrokenPipeError never fires (measured 2026-09-20 with a `codex` that
+        # exits 1 at once). A genuinely wedged server is still running here.
+        if not answers and server.poll() is not None:
+            never_started = True
+        try:
+            server.stdin.close()
+        except Exception:
+            pass
+        try:
+            os.killpg(os.getpgid(server.pid), signal.SIGKILL)
+        except Exception:
+            try:
+                server.kill()      # already reaped, or no group to signal
+            except Exception:
+                pass
+        try:
+            server.wait(timeout=2)
+        except Exception:
+            pass
+    return None if never_started else answers
+
+
+def codex_is_running():
+    try:
+        found = subprocess.run(["pgrep", "-f", r"(^|/)codex($| )"],
+                               capture_output=True, text=True, timeout=5)
+        return found.returncode == 0 and bool(found.stdout.strip())
+    except Exception:
+        return False
+
+
+def codex_int(value):
+    """An int from a JSON field, or None when the field is not one.
+
+    Every number below arrives from a server this script does not control, and
+    an int() or an arithmetic on a string raises out of codex_section into
+    main's blanket except, which DROPS the whole codex key -- the section
+    flickering in and out of the menu instead of saying what is wrong (PR
+    review, 2026-09-20). Booleans are rejected because `True` is an int in
+    Python and 100% is not what `usedPercent: true` means."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def codex_window_label(minutes):
+    """A window's name derived from its own length, because codex does not name
+    it. Nothing here hardcodes "5h" or "weekly": the account signed in on this
+    Mac reports a 43200-minute (30-day) primary window on a free plan, where a
+    paid one reports 300 minutes, and a label this script invented would have
+    been wrong for one of them."""
+    if not minutes or minutes <= 0:
+        return "Limit"
+    for size, one, many in ((10080, "Weekly", "%d-week"), (1440, "Daily", "%d-day"),
+                            (60, "Hourly", "%dh")):
+        if minutes % size == 0:
+            count = minutes // size
+            return one if count == 1 else many % count
+    return ("%dm" % minutes)[:12]
+
+
+def codex_snapshot_limits(rate_limits, prefix=""):
+    """Every window in ONE rate-limit snapshot, in the order codex reports it.
+    `usedPercent` is a percentage of the ceiling that actually stops you, the
+    same denominator the Claude side uses, so the two sections mean the same
+    thing by "78%".
+
+    codex sends no severity, so the app's own percentage thresholds decide --
+    except for the two states the backend states outright, which are worth more
+    than any threshold: a limit already reached, and a spend control tripped."""
+    reached = bool(rate_limits.get("rateLimitReachedType")) or \
+        bool(rate_limits.get("spendControlReached"))
+    limits = []
+    for key in ("primary", "secondary"):
+        window = rate_limits.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = codex_int(window.get("usedPercent"))
+        if used is None:
+            continue          # a window with no percentage is not a window
+        used = max(0, min(100, used))
+        resets_at = codex_int(window.get("resetsAt"))
+        label = codex_window_label(codex_int(window.get("windowDurationMins")))
+        limits.append({
+            "label": (prefix + " " + label).strip(),
+            "pct": used,
+            # An epoch-seconds instant here, where the Claude side gets an ISO
+            # string; both become seconds-from-now, and a lapsed one becomes 0
+            # rather than a negative countdown.
+            "reset_in": max(0, int(resets_at - NOW)) if resets_at else 0,
+            "severity": "critical" if reached else "normal",
+        })
+    return limits
+
+
+def codex_limits(usage):
+    """EVERY window the account has, across every bucket the server reports.
+
+    The response carries the same windows twice. `rateLimits` is, in its own
+    schema's words, the "backward-compatible single-bucket view; mirrors the
+    historical payload"; `rateLimitsByLimitId` is the "multi-bucket view keyed
+    by metered limit_id (for example, `codex`)". Reading both would draw the
+    same bar twice, so the multi-bucket view wins when it has anything in it.
+
+    THIS IS THE PART THE FREE PLAN CANNOT PROVE. The account this was built
+    against reports ONE bucket with ONE window -- 43200 minutes, 30 days, 0%
+    used (measured 2026-09-21) -- and a paid plan reports a rolling 5-hour
+    window with a weekly one beside it, which is the shape OpenAI's own pricing
+    page describes. So nothing here may assume one window, one bucket, or any
+    particular duration; the fixtures under test/codex-fixtures drive the
+    multi-bucket, multi-window case through this same code because no request
+    to this account can produce one."""
+    snapshots = codex_snapshots(usage)
+    # A bucket's id is a prefix only when there is more than one of them: with a
+    # single bucket (every account seen so far) it is the noise word "codex" in
+    # front of every row in a section already titled Codex.
+    named = len(snapshots) > 1
+    limits = []
+    for limit_id, snapshot in snapshots:
+        limits += codex_snapshot_limits(
+            snapshot, (snapshot.get("limitName") or limit_id) if named else "")
+    return limits
+
+
+# What the backend calls the state it is in, said in words a menu row can
+# carry. The keys are the RateLimitReachedType enum from the app-server's own
+# schema; an unknown one is printed as itself rather than swallowed, because a
+# state this script has not heard of is still a state worth seeing.
+RATE_LIMIT_REACHED_TEXT = {
+    "rate_limit_reached": "Rate limit reached",
+    "workspace_owner_credits_depleted": "Workspace credits depleted (owner)",
+    "workspace_member_credits_depleted": "Workspace credits depleted",
+    "workspace_owner_usage_limit_reached": "Workspace usage limit reached (owner)",
+    "workspace_member_usage_limit_reached": "Workspace usage limit reached",
+}
+
+
+def codex_snapshots(usage):
+    """Every rate-limit snapshot in the answer, in ONE deterministic order, so
+    the bars and the sentences under them can never be reading different halves
+    of the same response -- which they were: the bars preferred
+    `rateLimitsByLimitId` while the sentences read only `rateLimits`, the field
+    the schema itself calls backward-compatible, so the day the server stops
+    sending it the bars would have survived and the credits and the ceiling
+    would have vanished without a word (PR review, 2026-09-21)."""
+    buckets = usage.get("rateLimitsByLimitId")
+    if isinstance(buckets, dict) and buckets:
+        ordered = [(limit_id, buckets[limit_id]) for limit_id in sorted(buckets)
+                   if isinstance(buckets[limit_id], dict)]
+        if ordered:
+            return ordered
+    single = usage.get("rateLimits")
+    return [("", single)] if isinstance(single, dict) else []
+
+
+def codex_state_notes(usage):
+    """The facts beside the bars: credits, and whether a ceiling has been hit.
+
+    Said only when they SAY something. "Credits: none" under every window on
+    every poll of a plan that has no credits is a row that never changes and
+    never helps, and this meter's whole argument is that a number on screen
+    should be one somebody would act on. Deduplicated, because several metered
+    buckets on one account usually share one credit pool and one line about it
+    is the fact."""
+    notes = []
+
+    def add(text):
+        if text and text not in notes:
+            notes.append(text)
+
+    snapshots = codex_snapshots(usage)
+    # Ceilings before balances, across every bucket before any bucket's credits.
+    # Reading each bucket whole put "Credits: unlimited" above "Rate limit
+    # reached" purely because the bucket holding the credits sorted first, and
+    # a row saying you are stopped must not sit under a row saying you are fine.
+    for _, snapshot in snapshots:
+        reached = snapshot.get("rateLimitReachedType")
+        if isinstance(reached, str) and reached:
+            add(RATE_LIMIT_REACHED_TEXT.get(reached, reached.replace("_", " ").capitalize()))
+        if snapshot.get("spendControlReached") is True:
+            add("Spend control reached")
+    for _, snapshot in snapshots:
+        credits = snapshot.get("credits")
+        if isinstance(credits, dict):
+            if credits.get("unlimited") is True:
+                add("Credits: unlimited")
+            elif credits.get("balance"):
+                add("Credits: %s" % str(credits["balance"])[:24])
+            elif credits.get("hasCredits") is True:
+                add("Credits available")
+    return notes
+
+
+def codex_configured_model(config_path):
+    """The model a bare `codex` would run, from config.toml's TOP-LEVEL `model`
+    key, or None when it sets none (which is the whole answer here: this fleet
+    deliberately pins no model, so the catalog default applies).
+
+    STOPS AT THE FIRST `[table]` HEADER, and that is the security property, not
+    an optimisation. codex keeps MCP server definitions in this file and on this
+    fleet one of them carries a GitHub token in an `http_headers` table; a parse
+    that walks the whole file could put that token one bug away from the blob
+    this script prints.
+
+    Two more stops, because "cannot reach a credential" was measured and found
+    to be almost-but-not-quite true (PR review, 2026-09-21). A top-level
+    multi-line string can contain ANYTHING, `model = "leak"` included, and this
+    is not a TOML parser, so a line opening one ends the read rather than being
+    read into. And a value that is an inline table or an array is a STRUCTURE --
+    `model = { id = "a", token = "..." }` was returned verbatim and printed in
+    the menu -- where the only thing wanted here is a model name, so anything
+    that is not a plain scalar is refused. Between the three stops the parse
+    reads top-level scalars and nothing else."""
+    try:
+        for raw in config_path.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                return None                      # the tables begin; stop reading
+            if '"""' in line or "\'\'\'" in line:
+                return None                      # a multi-line string begins
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != "model":
+                continue
+            value = value.strip().split("#")[0].strip()
+            if value[:1] in ("{", "["):
+                return None                      # a structure, not a name
+            return value.strip("\"'") or None
+    except Exception:
+        pass
+    return None
+
+
+def codex_models(models_result, configured):
+    """(what the effective model is called, every model this account may pick).
+
+    The server names its own catalog default with `isDefault`, so nothing here
+    hardcodes a model id that the next release retires -- the three this account
+    sees today are gpt-5.6-terra, gpt-5.6-luna and gpt-5.5 (measured
+    2026-09-21), and that list is the SERVER's answer for this account, not a
+    constant. Hidden models are left out: they are hidden from codex's own
+    picker, so a meter that listed them would be offering something the tool
+    will not."""
+    if not isinstance(models_result, dict):
+        return (configured or ""), []
+    available, default_label, configured_label = [], "", ""
+    for model in (models_result.get("data") or []):
+        if not isinstance(model, dict) or model.get("hidden") is True:
+            continue
+        label = (model.get("displayName") or model.get("id") or "").strip()
+        if not label:
+            continue
+        available.append(label)
+        if model.get("isDefault") is True:
+            default_label = label
+        if configured and configured in (model.get("id"), model.get("model")):
+            configured_label = label
+    # A configured model the catalog does not list is still what codex would
+    # run, so it is reported as its raw id rather than silently replaced by the
+    # default -- the meter must not tell you you are on a model you are not.
+    return (configured_label or configured or default_label), available
+
+
+def codex_backoff_state():
+    try:
+        parts = CODEX_BACKOFF.read_text().split()
+        stamped_at, wait = float(parts[0]), float(parts[1])
+        why = parts[2] if len(parts) > 2 else "error"
+        left = stamped_at + wait - time.time()
+        return left > 0, why, max(0, int(left))
+    except Exception:
+        return False, "", 0
+
+
+def codex_fetch(binary):
+    """(reading, errkind). One app-server run answers all three questions."""
+    calls = {
+        1: ("account/read", {}),
+        # excludeResetCreditDetails skips a second backend lookup the app-server
+        # would otherwise make; its own schema calls that the shape for
+        # "background usage polls", which is exactly what this is.
+        2: ("account/rateLimits/read", {"excludeResetCreditDetails": True}),
+    }
+    want_models = env("CODEX_MODELS", "1") != "0"
+    if want_models:
+        calls[3] = ("model/list", {})
+    answers = codex_app_server(binary, calls)
+    if answers is None:
+        return None, "spawn"
+    usage = answers.get(2)
+    if not isinstance(usage, dict):
+        return None, "timeout" if 2 not in answers else "rpc"
+    rate_limits = usage.get("rateLimits")
+    if not isinstance(rate_limits, dict):
+        return None, "shape"
+    # A JSON-RPC `result` is whatever the server sent; only an object has
+    # `.get`, and the account read is the optional half of this -- a bad one
+    # must cost the section its email, never its numbers.
+    account = answers.get(1)
+    account = (account.get("account") if isinstance(account, dict) else None) or {}
+    if not isinstance(account, dict):
+        account = {}
+    # The model half is optional in both directions: a model/list that failed
+    # must cost the section its model rows, never its numbers.
+    #
+    # USAGE_METER_CODEX_MODELS=0 has to reach the CONFIG read as well as the
+    # call, and that is the whole point of the flag rather than a detail: it is
+    # the only switch a user has over the one security-relevant file this
+    # collector opens, and it did not turn it off (PR review, 2026-09-21).
+    model, available = "", []
+    if want_models:
+        model, available = codex_models(
+            answers.get(3), codex_configured_model(CODEX_HOME / "config.toml"))
+    return {"email": account.get("email") or "",
+            "plan": rate_limits.get("planType") or account.get("planType") or "",
+            "model": model, "models": available,
+            "usage": usage}, None
+
+
+def codex_section():
+    """The `codex` key of the blob, or None when this Mac has no codex at all."""
+    if env("CODEX", "1") == "0":
+        return None
+    binary = codex_binary()
+    if not binary or not CODEX_HOME.is_dir():
+        return None                      # not installed: contribute nothing
+    if not (CODEX_HOME / "auth.json").exists():
+        # Installed but signed out. The section exists -- the tool is here --
+        # and says the one thing that would make it work, the same way the app
+        # already does for a Claude Code that has never been signed in. The file
+        # is checked for EXISTENCE and never opened.
+        return {"ok": False, "note": "Not signed in — run `codex login`"}
+
+    cached = load_json(CODEX_CACHE)
+    reading, fetched_at = None, 0.0
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict) \
+            and cached.get("v") == CODEX_CACHE_VERSION:
+        reading, fetched_at = cached["data"], float(cached.get("fetched_at") or 0)
+    in_backoff, fail_why, retry_in = codex_backoff_state()
+    # Which TTL applies depends on whether codex is running, and asking that
+    # forks a pgrep. A reading younger than the SHORTEST TTL that could apply is
+    # fresh whichever one it is, so the fork is only paid by a poll that might
+    # actually fetch -- 30 s ticks all day against a warm cache pay nothing
+    # (PR review, 2026-09-20). An explicit override IS the shortest TTL.
+    override = int(os.environ.get("CODEX_USAGE_TTL", "0") or 0)
+    floor = override if override > 0 else CODEX_TTL_WHILE_RUNNING
+    if (reading is None or NOW - fetched_at >= floor) and not in_backoff:
+        ttl = override or \
+            (CODEX_TTL_WHILE_RUNNING if codex_is_running() else CODEX_TTL_WHILE_IDLE)
+    else:
+        ttl = floor
+    if (reading is None or NOW - fetched_at >= ttl) and not in_backoff:
+        fresh, err = codex_fetch(binary)
+        if fresh:
+            reading, fetched_at = fresh, NOW
+            fail_why, retry_in = "", 0
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                # 0600: the account's email, nobody else's business.
+                write_private(CODEX_CACHE, json.dumps(
+                    {"v": CODEX_CACHE_VERSION, "fetched_at": NOW, "data": fresh}))
+                if CODEX_BACKOFF.exists():
+                    CODEX_BACKOFF.unlink()
+            except Exception:
+                pass
+        else:
+            try:
+                CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+                CODEX_BACKOFF.write_text("%d %d %s" % (time.time(), CODEX_BACKOFF_SECONDS, err))
+            except Exception:
+                pass
+            fail_why, retry_in = err, CODEX_BACKOFF_SECONDS
+
+    out = {"ok": False}
+    if fail_why:
+        out["fetch_err"] = CODEX_FETCH_ERROR_TEXT.get(fail_why, fail_why)
+        out["retry_in"] = retry_in
+    if reading is None or fetched_at <= 0:
+        # Same contract as the Claude side: a number that cannot be aged is not
+        # a number. The section still exists, so the reason is visible.
+        out.setdefault("note", "No usage read yet")
+        return out
+    # The whole usage answer, kept as the server sent it: the shape is read at
+    # RENDER time, so a new window or bucket the server starts sending is drawn
+    # by the next poll rather than by the next release. A cache too old to have
+    # it cannot get here -- CODEX_CACHE_VERSION rejected it above.
+    usage = reading.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    limits = codex_limits(usage)
+    if not limits:
+        out["note"] = "codex reported no usage window"
+        return out
+    out["ok"] = True
+    out["limits"] = limits
+    out["email"] = reading.get("email") or ""
+    out["plan"] = reading.get("plan") or ""
+    out["source"] = "codex app-server"
+    # The short form the menu bar has room for when a codex window is the
+    # hottest thing on the machine and takes the number over.
+    out["tag"] = "cdx"
+    out["age_s"] = max(0, int(NOW - fetched_at))
+    # Plain sentences the app prints under the bars. The COLLECTOR owns the
+    # wording and the app owns the drawing, so a new fact -- another backend
+    # state, another credit shape -- is one line here and no change there.
+    details = codex_state_notes(usage)
+    model = reading.get("model") or ""
+    available = [m for m in (reading.get("models") or []) if isinstance(m, str)]
+    if model:
+        details.append("Model: %s" % model[:40])
+    others = [m for m in available if m != model]
+    if others:
+        details.append("Also available: %s" % ", ".join(others)[:60])
+    if details:
+        out["details"] = details
+    return out
+
+
+def claude_section():
+    """The `claude` key of the blob. Always present: this is the Usage Meter,
+    and an absent Claude Code is the app's own empty state, not a missing
+    section."""
+    identity = pick_identity()
+    if identity is None:
+        return {"ok": False}
+    reading = current_reading(identity)
+    limits, scoped_label = limits_and_scoped_label(reading.utilization)
+
+    # NOTHING TO SHOW IS NOT "ok". An identity can be known by its email alone
+    # -- a fresh /login whose cachedUsageUtilization has not been written yet --
+    # and with the live path down that leaves no limits and no timestamp to age
+    # them by. Emitted as ok:true (measured 2026-09-12) that produced
+    # {"ok": true, "source": "session-cache", "age_s": 1789211658} -- the raw
+    # epoch, because the age is computed against a taken_at of 0 -- and the app,
+    # which gates only on ok, painted three grey 0% bars as if they were real.
+    # A missing timestamp is disqualifying on its own: this meter's contract is
+    # that every number carries its age, so a reading that cannot be aged is
+    # not a reading. ok:false selects the app's own empty state, a dash.
+    if reading.taken_at <= 0 or not limits:
+        return {"ok": False}
+
+    out = dict(limits)
+    out["ok"] = True
+    out["account"] = identity.label
+    out["email"] = identity.email
+    out["scoped_label"] = scoped_label or DEFAULT_SCOPED_LABEL
+    out["source"] = reading.source
+    out["age_s"] = max(0, int(NOW - reading.taken_at))
+    out["stale_hours"] = max(0.0, round((NOW - reading.taken_at) / 3600, 1))
+    if reading.fetch_error:
+        out["fetch_err"] = FETCH_ERROR_TEXT.get(reading.fetch_error, reading.fetch_error)
+        out["retry_in"] = reading.retry_in
+    append_history(identity.label, limits)
+    return out
+
+
+# ── agy (Google's Antigravity CLI) ──────────────────────────────────────────
+#
+# agy HAS a quota -- its TUI shows `/usage`, `/quota` and `/credits` panels --
+# and NOTHING can read it from outside the process. Probed twice, signed out on
+# 2026-09-20 and signed IN on 2026-09-21, against agy 1.2.7:
+#
+#   - No subcommand prints it. The whole set is agent(s), changelog, help,
+#     install, mcp, mic-serve, models, plugin(s), remote-control, update; the
+#     quota panels are slash commands inside a session, not commands.
+#   - Nothing persists it. Signed in, `doRefreshQuota` fires four or five times
+#     a session and logs only "starting reload" and "skipped (throttled)" --
+#     there is no completion line, and a grep for QuotaSummary,
+#     remaining_fraction and FetchQuotaStatus across both log files matched
+#     zero times. `jetski_state.pbtxt` carries onboarding state and no quota
+#     key; nothing under cache/, implicit/, brain/, knowledge/ or the
+#     conversation database holds a number; no file under ~/.gemini is named
+#     for quota, usage or credits.
+#   - Its statusline cannot carry it: agy runs a shell command and renders that
+#     command's stdout, and pipes no payload IN, so there is no field to read.
+#   - It DOES run a local HTTP server (a live agy listens on loopback), but the
+#     only endpoint that answers is /healthz, with a liveness object. There is
+#     no documented equivalent of codex's `account/rateLimits/read`, and
+#     guessing at undocumented routes on the owner's own signed-in session is
+#     not something a menu-bar meter gets to do.
+#
+# So agy contributes ONE LINE, not a section: a section that can only ever say
+# "no data" is a permanent empty chair, where the fact actually worth carrying
+# is that the meter knows agy is installed and knows why it has nothing. The
+# `footnote` flag is general -- the day agy persists a number, it is deleted
+# and agy becomes a section like codex.
+
+AGY_HOME = pathlib.Path(os.environ.get("GEMINI_HOME") or (HOME / ".gemini"))
+
+
+def agy_section():
+    """The `agy` key of the blob, or None when this Mac has no agy."""
+    if env("AGY", "1") == "0":
+        return None
+    binary = shutil.which("agy")
+    if not binary:
+        for directory in CODEX_BIN_DIRS:      # the same search, for the same reason
+            candidate = pathlib.Path(os.path.expanduser(directory)) / "agy"
+            if os.access(str(candidate), os.X_OK) and candidate.is_file():
+                binary = str(candidate)
+                break
+    # `~/.gemini` alone is NOT the signal: the gemini CLI is a different tool
+    # that lives there too, and a bare `gemini --version` creates it. The
+    # subdirectory agy writes on its first run is what says agy has run here.
+    if not binary or not (AGY_HOME / "antigravity-cli").is_dir():
+        return None
+    return {"ok": False, "footnote": True,
+            "note": "Antigravity is installed · it exposes no usage locally"}
+
+
+def main():
+    # `claude` is always emitted; every other tool contributes a key ONLY when
+    # it is installed, so the blob a Mac with neither produces carries the same
+    # keys and values this script produced before either was supported. A section
+    # that raises is dropped rather than taking the whole blob down with it --
+    # the Claude reading is what this app exists for and must survive a second
+    # tool misbehaving.
+    blob = {"claude": claude_section(), "ts": int(NOW)}
+    for key, build in (("codex", codex_section), ("agy", agy_section)):
+        try:
+            section = build()
+        except Exception:
+            section = None
+        if section is not None:
+            blob[key] = section
+    print(json.dumps(blob))
+
+
+main()
+PY
+meter_json="$(cat "$py_out")"
+rm -f "$py_out"
+
+# The Python program prints the whole blob, "ts" included. An empty file means
+# it never got to print -- killed by the app's watchdog, or dead on a syntax
+# error -- and the app needs the shape it knows how to show as "no reading"
+# rather than nothing at all.
+[ -n "$meter_json" ] || meter_json="$(printf '{"claude":{"ok":false},"ts":%s}' "$(date +%s)")"
+printf '%s\n' "$meter_json"

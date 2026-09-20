@@ -1,6 +1,6 @@
-# Claude Meter
+# Usage Meter
 
-Claude Meter is a macOS menu-bar item that shows how much of your Claude usage
+Usage Meter is a macOS menu-bar item that shows how much of your Claude usage
 limits you have spent: the 5-hour session window, the weekly all-models window
 and the weekly per-model-family window, each as a percentage of the ceiling that
 will actually stop you. The numbers come from the same OAuth usage endpoint
@@ -22,12 +22,12 @@ with the tools and the system.
 
 ```sh
 git clone https://github.com/ayush5harma/claude-meter
-cd claude-meter
+cd usage-meter
 bash install.sh
 ```
 
-That builds `Claude Meter.app` into `/Applications`, installs the collector to
-`~/.local/bin/claude-meter-stats`, writes a launchd agent into
+That builds `Usage Meter.app` into `/Applications`, installs the collector to
+`~/.local/bin/usage-meter-stats`, writes a launchd agent into
 `~/Library/LaunchAgents/` and loads it. The item appears in the menu bar within
 a few seconds, and comes back at every login.
 
@@ -40,7 +40,7 @@ APP_DIR="$HOME/Applications" bash install.sh
 ```
 
 Everything else it writes is yours: `~/.local/bin`, `~/Library/LaunchAgents`
-and `~/.cache/claude-meter`. It says so if `~/.local/bin` is not on your PATH,
+and `~/.cache/usage-meter`. It says so if `~/.local/bin` is not on your PATH,
 which matters only for running the collector by hand. `bash install.sh --force`
 rebuilds even when nothing has changed.
 
@@ -48,15 +48,15 @@ To remove it:
 
 ```sh
 bash uninstall.sh            # or: bash install.sh --uninstall
-bash uninstall.sh --purge    # also delete ~/.cache/claude-meter
+bash uninstall.sh --purge    # also delete ~/.cache/usage-meter
 ```
 
 The cache (the API answer, the backoff stamp and the usage history) is kept
 unless you pass `--purge`, and `--purge` refuses to delete anything that is not
 an absolute path at least two levels deep holding at least one of this app's own
-files — `CLAUDE_METER_CACHE_DIR` is an environment variable, and `rm -rf` does
+files — `USAGE_METER_CACHE_DIR` is an environment variable, and `rm -rf` does
 not get the benefit of the doubt. The one gap: an explicitly EMPTY
-`CLAUDE_METER_CACHE_DIR` falls back to the default directory and is purged, so
+`USAGE_METER_CACHE_DIR` falls back to the default directory and is purged, so
 unset the variable rather than emptying it.
 
 Built and used on macOS 26 and 27. The sources use no API newer than macOS 14
@@ -118,10 +118,10 @@ is not installed contributes nothing at all.
 
 The percentages are the ones last collected, with their age worked out as you
 look; opening the menu also starts a collection, so the bar, and the next look,
-are fresh. `Refresh Now` (⌘R) collects immediately. `Quit Claude Meter` (⌘Q)
+are fresh. `Refresh Now` (⌘R) collects immediately. `Quit Usage Meter` (⌘Q)
 exits the app, but the launchd agent keeps it alive and starts it again a
 moment later; to stop it for longer, unload the agent (`launchctl bootout
-gui/$(id -u)/com.ayushsharma.claude-meter`) or uninstall.
+gui/$(id -u)/com.ayushsharma.usage-meter`) or uninstall.
 
 ### Why the glyph is shaped that way
 
@@ -158,7 +158,7 @@ working in; see [Identities](#identities) to name them yourself.
 
 Two pieces, and a launchd agent that keeps the app running.
 
-- **`bin/claude-meter-stats`**, a shell script wrapping a Python program, prints
+- **`bin/usage-meter-stats`**, a shell script wrapping a Python program, prints
   one JSON object: the three limits of the identity you are working in, the
   account it belongs to, where the numbers came from and how old they are. It
   reads Claude Code's own config files, derives that identity's keychain item to
@@ -206,7 +206,7 @@ goes) is `install.sh` only.
 
 **Which directories are considered**, in order:
 
-1. `CLAUDE_METER_CONFIG_DIRS` (colon-separated) replaces the list entirely.
+1. `USAGE_METER_CONFIG_DIRS` (colon-separated) replaces the list entirely.
 2. Otherwise: whatever `CLAUDE_CONFIG_DIR` names, then the default `~/.claude`,
    then any `~/.claude-<name>` directory that actually holds a `.claude.json`.
 
@@ -216,12 +216,12 @@ pid still alive — and the freshest cached utilisation only breaks a tie. An
 identity with no cached utilisation is still a candidate, because right after a
 `/login` the new account has none.
 
-**Naming them yourself.** An entry in `CLAUDE_METER_CONFIG_DIRS` may be
+**Naming them yourself.** An entry in `USAGE_METER_CONFIG_DIRS` may be
 `label=path` instead of a bare path, and the label is then what the dropdown
 header and the usage history record:
 
 ```sh
-CLAUDE_METER_CONFIG_DIRS="work=$HOME/.claude:personal=$HOME/.claude-personal"
+USAGE_METER_CONFIG_DIRS="work=$HOME/.claude:personal=$HOME/.claude-personal"
 ```
 
 A bare path keeps the directory-derived name: `~/.claude` is `default`,
@@ -293,16 +293,16 @@ marks the meter sick.
 ### Files
 
 ```
-~/.cache/claude-meter/usage-api.json       the last good API answer
-~/.cache/claude-meter/usage-api.backoff    when the network path may be tried again
-~/.cache/claude-meter/usage-history.csv    the points the dropdown graphs
-~/.cache/claude-meter/codex-usage.json     the last good codex reading (only if codex is installed)
-~/.cache/claude-meter/codex-usage.backoff  when codex may be asked again
-~/.cache/claude-meter/claude-meter.launchd.log   the agent's stderr
+~/.cache/usage-meter/usage-api.json       the last good API answer
+~/.cache/usage-meter/usage-api.backoff    when the network path may be tried again
+~/.cache/usage-meter/usage-history.csv    the points the dropdown graphs
+~/.cache/usage-meter/codex-usage.json     the last good codex reading (only if codex is installed)
+~/.cache/usage-meter/codex-usage.backoff  when codex may be asked again
+~/.cache/usage-meter/usage-meter.launchd.log   the agent's stderr
 ```
 
-`CLAUDE_METER_CACHE_DIR` moves that directory for the collector and the
-installer. The app's history graph always reads `~/.cache/claude-meter`, so
+`USAGE_METER_CACHE_DIR` moves that directory for the collector and the
+installer. The app's history graph always reads `~/.cache/usage-meter`, so
 pointing the collector elsewhere leaves the graph empty.
 
 In the repository:
@@ -311,7 +311,7 @@ In the repository:
 Sources/main.swift      the app: collection, drawing, the menu
 Sources/icon.swift      draws the app icon at build time (no binary asset in the repo)
 build.sh                two swiftc calls, the icon, ad-hoc signing
-bin/claude-meter-stats  the collector: identities, the usage endpoint, the JSON
+bin/usage-meter-stats  the collector: identities, the usage endpoint, the JSON
 launchd/…plist.template the resident agent
 install.sh              build + install + load; also --uninstall
 uninstall.sh            thin wrapper over install.sh --uninstall
@@ -330,10 +330,10 @@ module, another launcher — depends on these three things and nothing else.
 
 | Invocation | Behaviour |
 |---|---|
-| `ClaudeMeter` | Runs the menu-bar app. Terminates any other running instance of the same bundle id first. |
-| `ClaudeMeter --run <program> [args…]` | Spawns the program as a child, waits, exits with its status. Never draws a menu-bar item. |
+| `UsageMeter` | Runs the menu-bar app. Terminates any other running instance of the same bundle id first. |
+| `UsageMeter --run <program> [args…]` | Spawns the program as a child, waits, exits with its status. Never draws a menu-bar item. |
 
-**Collector output** — `claude-meter-stats` prints one JSON object on stdout:
+**Collector output** — `usage-meter-stats` prints one JSON object on stdout:
 
 ```json
 {"claude": { ... }, "ts": 1789210900, "codex": { ... }}
@@ -384,19 +384,19 @@ Which tools the app knows how to name, and in what order, is one table in
 `main.swift` (`toolNames`). A key not in it is ignored; a tool in it whose key
 the collector does not emit draws nothing.
 
-**Collector environment** — `CLAUDE_METER_CONFIG_DIRS` (colon-separated config
+**Collector environment** — `USAGE_METER_CONFIG_DIRS` (colon-separated config
 dirs, each optionally `label=path`, replacing discovery), `CLAUDE_CONFIG_DIR`
-(Claude Code's own, added to the defaults), `CLAUDE_METER_CACHE_DIR`,
+(Claude Code's own, added to the defaults), `USAGE_METER_CACHE_DIR`,
 `USAGE_API_TTL`, `CODEX_HOME` (Codex's own), `CODEX_USAGE_TTL`,
-`CLAUDE_METER_CODEX` (`0` to drop the Codex section),
-`CLAUDE_METER_CODEX_MODELS` (`0` to drop just its model rows), `GEMINI_HOME`
-(where `agy` keeps its state) and `CLAUDE_METER_AGY` (`0` to drop its line).
+`USAGE_METER_CODEX` (`0` to drop the Codex section),
+`USAGE_METER_CODEX_MODELS` (`0` to drop just its model rows), `GEMINI_HOME`
+(where `agy` keeps its state) and `USAGE_METER_AGY` (`0` to drop its line).
 
-The app locates the collector at: `$CLAUDE_METER_STATS`, then
-`~/.local/bin/claude-meter-stats`, then `/usr/local/bin/claude-meter-stats`,
-then `/opt/homebrew/bin/claude-meter-stats` — first executable wins.
+The app locates the collector at: `$USAGE_METER_STATS`, then
+`~/.local/bin/usage-meter-stats`, then `/usr/local/bin/usage-meter-stats`,
+then `/opt/homebrew/bin/usage-meter-stats` — first executable wins.
 
-**launchd agent** — `launchd/com.ayushsharma.claude-meter.plist.template`, with
+**launchd agent** — `launchd/com.ayushsharma.usage-meter.plist.template`, with
 `__LABEL__`, `__APP__` (the app's executable) and `__LOG__` substituted:
 `RunAtLoad` and `KeepAlive` true, `ProcessType` `Interactive` (a person is
 looking at it; it must not be throttled into the background band),
@@ -474,14 +474,14 @@ the question Codex's own UI asks.
   states its backend states outright, `rateLimitReachedType` and
   `spendControlReached`, which are taken as critical whatever the percentage
   says.
-- **Cached** in `~/.cache/claude-meter/codex-usage.json` (0600; it holds the
+- **Cached** in `~/.cache/usage-meter/codex-usage.json` (0600; it holds the
   account email), refreshed at most once per TTL — 120 s while a `codex` process
   is alive, 900 s when idle — with a 180 s backoff after a failure. The cache
   carries a **version**, and an older one is not a cache: an upgraded collector
   refetches once rather than serving a reading with its new rows missing for up
   to a TTL. `CODEX_HOME` and `CODEX_USAGE_TTL` are honoured;
-  `CLAUDE_METER_CODEX=0` turns the section off entirely and
-  `CLAUDE_METER_CODEX_MODELS=0` drops just the model rows.
+  `USAGE_METER_CODEX=0` turns the section off entirely and
+  `USAGE_METER_CODEX_MODELS=0` drops just the model rows.
 - **Not shown, deliberately:** `account/usage/read` exists and answers, with
   lifetime and per-day **token** totals. Token counts with no ceiling to divide
   by are exactly what the Claude side of this meter replaced with percentages,
@@ -493,7 +493,7 @@ the question Codex's own UI asks.
   value needed is taken by a reader that stops at the first `[table]` header,
   at the first line that opens a multi-line string, and at any value that is an
   inline table or an array — so it reads top-level scalars and nothing else.
-  `CLAUDE_METER_CODEX_MODELS=0` turns that read off along with `model/list`;
+  `USAGE_METER_CODEX_MODELS=0` turns that read off along with `model/list`;
   the fixtures cover all four stops.
 
 #### What the plans get — OpenAI's published limits
@@ -595,8 +595,8 @@ Codex's: the collector and the app already draw one from the same data.
 
 ### Bundle identifier and launchd label
 
-The bundle id is `local.ayushsharma.claude-meter` and the agent label is
-`com.ayushsharma.claude-meter`. **Change them before your first build if you
+The bundle id is `local.ayushsharma.usage-meter` and the agent label is
+`com.ayushsharma.usage-meter`. **Change them before your first build if you
 want your own** — macOS keys every TCC privacy grant to the bundle id, so
 changing it after the fact makes the system forget every permission the app was
 given, and the app's single-instance sweep uses the same id. The bundle id is in
@@ -606,7 +606,7 @@ is the `AGENT_LABEL` default in `build.sh` and `install.sh`.
 ### Running a program under the app's identity
 
 ```sh
-"/Applications/Claude Meter.app/Contents/MacOS/ClaudeMeter" --run /bin/bash /path/to/job.sh
+"/Applications/Usage Meter.app/Contents/MacOS/UsageMeter" --run /bin/bash /path/to/job.sh
 ```
 
 This runs the program as a **child** of the app and waits for it, passing
@@ -622,7 +622,7 @@ cannot usefully be granted anything, because the grant would attach to
 this bundle's grants.
 
 **Know what this costs.** The flag is not a privilege check: anything already
-running as you can borrow this app's grants by exec'ing `ClaudeMeter --run`.
+running as you can borrow this app's grants by exec'ing `UsageMeter --run`.
 That is the same trust boundary every program you run already sits inside, but
 it means the grants you give this bundle are effectively grants to your whole
 user session — so give it only what you would give any program you run, and if
@@ -650,17 +650,17 @@ the meter look like part of the menu bar rather than a notification.
 ### Troubleshooting
 
 **Nothing in the menu bar.** Read the agent's stderr log,
-`~/.cache/claude-meter/claude-meter.launchd.log`, and check the job:
-`launchctl print gui/$(id -u)/com.ayushsharma.claude-meter`.
+`~/.cache/usage-meter/usage-meter.launchd.log`, and check the job:
+`launchctl print gui/$(id -u)/com.ayushsharma.usage-meter`.
 
 **A dash instead of a number, or a yellow dot.** Run the collector by hand:
 
 ```sh
-bash ~/.local/bin/claude-meter-stats
+bash ~/.local/bin/usage-meter-stats
 ```
 
 `{"claude": {"ok": false}, ...}` means no identity was found — sign in to Claude
-Code once, or point `CLAUDE_METER_CONFIG_DIRS` at the right directory.
+Code once, or point `USAGE_METER_CONFIG_DIRS` at the right directory.
 `"fetch_err": "no valid token"` means the keychain has no unexpired token for
 that identity; Claude Code refreshes it, so run `claude` once.
 
@@ -678,7 +678,7 @@ the legacy `.icns` (light appearance only). Install Xcode and rebuild with
 
 **`install.sh` says the plist is read-only or a symlink.** Another tool manages
 that launchd agent — a Nix flake, or home-manager. `install.sh` will not write
-over it; uninstall that first, or leave Claude Meter to it.
+over it; uninstall that first, or leave Usage Meter to it.
 
 ### What was measured
 
