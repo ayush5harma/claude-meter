@@ -124,6 +124,14 @@ gui/$(id -u)/com.ayushsharma.claude-meter`) or uninstall.
 
 ### Why the glyph is shaped that way
 
+| Claude alone | Claude + Codex | Codex hot | Five bars |
+|---|---|---|---|
+| ![three bars](docs/menu-bar/glyph-claude-only.png) | ![four bars](docs/menu-bar/glyph-claude-and-codex.png) | ![four bars, the last one red](docs/menu-bar/glyph-codex-hot.png) | ![five bars](docs/menu-bar/glyph-five-bars.png) |
+| Session, week, per-model cap — unchanged | a fourth bar, Codex's worst window, after a wider gap (here at 0%, so an empty track) | the fourth bar red, and the number beside it reads `cdx 96%` | the geometry at five, from a fixture: the stack tightens, the item does not widen |
+
+Captured from the running app at 2x and cropped to the glyph. The item is 16 pt
+wide in all four.
+
 With more than one tool installed, a meter that shows only Claude is not a
 meter: a Codex window at 96% would be invisible until somebody opened the menu.
 Two other shapes were considered for the 16 px item and both lost.
