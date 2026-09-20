@@ -2,9 +2,9 @@
 // utilisation: the 5-hour session window, the weekly all-models window and the
 // weekly premium-model ("scoped") window, each against its real ceiling.
 //
-// GLANCEABLE, NOT A WALL. The bar shows one compact percentage per installed
-// agent beside the stacked glyph. The detail (per-limit bars, resets, history
-// graph) lives in the dropdown, rebuilt fresh every time it opens.
+// GLANCEABLE, NOT A WALL. The bar names each provider and shows its tightest
+// percentage. The detail (per-limit bars, resets, history graph) lives in the
+// dropdown, rebuilt fresh every time it opens.
 //
 // A STALE METER MUST LOOK STALE. The collector can fail (network down, the
 // usage endpoint rate-limiting) and the OS can sleep for days, so the app
@@ -19,18 +19,10 @@
 // thing making a number readable; a number goes warning-coloured only when a
 // limit is actually hot.
 //
-// ONE METER, EVERY AGENT. The glyph shows Claude's three windows and then ONE
-// BAR PER OTHER TOOL the meter has a number for, so a Codex window at 96% is
-// visible without opening anything -- which is the whole point of a meter, and
-// was not true when Codex lived only in the dropdown. Cl, Cd and Ag beside
-// the glyph report each tool's tightest window even before one turns hot.
-//
-// Claude keeps three bars rather than collapsing to one, because on the
-// commonest Mac -- Claude alone -- one bar would throw away two limits that
-// are legible today to solve a problem that Mac does not have. The stack is
-// re-fitted to the menu bar's height instead of the item growing wider: the
-// item is 16 pt at three bars and 16 pt at five, so adding a tool never moves
-// anything else in the menu bar.
+// ONE METER, EVERY AGENT. A provider name makes every number self-explanatory:
+// `Claude 42% · Codex 16% · agy 61%`. A dash means this provider has not
+// reported a quota. Each percentage is warning-coloured independently; a hot
+// Claude limit must not paint Codex or agy red.
 //
 // ROTATING BETWEEN TOOLS WAS REJECTED and it was not close: a value that
 // changes while nothing changed is noise, and a meter that is sometimes
@@ -826,8 +818,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.menu = statusMenu
         if let button = statusItem.button {
-            button.imagePosition = .imageLeading
-            button.attributedTitle = barText("…", .secondaryLabelColor)
+            button.image = nil
+            button.attributedTitle = barText("Collecting usage…", .secondaryLabelColor)
+            button.toolTip = "Quota used — collecting readings"
         }
         refresh()
 
@@ -988,19 +981,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func render() {
         guard let button = statusItem.button else { return }
-        let badge = badgeColor()
-        guard haveStats, stats.ok || !numericTools.isEmpty else {
-            // Before the first collection lands there is nothing to be sick
-            // about yet, but the dash still has to say it is not a reading.
-            button.image = barsGlyph([Limit(), Limit(), Limit()],
-                                     badge: badge ?? (haveStats ? nil : muted(.systemYellow)))
-            button.attributedTitle = barText("—", .secondaryLabelColor)
-            return
+        button.image = nil
+        let title = statusTitle(dimForFreshness: dataStale || collectorSick)
+        if collectorSick {
+            title.append(barText(" · check", .systemRed))
+        } else if dataStale {
+            title.append(barText(" · stale", .secondaryLabelColor))
         }
-        let glyph = glyphBars
-        button.image = barsGlyph(glyph.limits, groupAfter: glyph.groupAfter, badge: badge)
-        let (text, color) = statusTitle()
-        button.attributedTitle = barText(text, color)
+        button.attributedTitle = title
+        let cause = collectorSick ? " — \(lastError ?? "collector needs attention")" :
+            (dataStale ? " — data is stale" : "")
+        button.toolTip = "Quota used — \(title.string)\(cause)"
     }
 
     // The meter's own health, never a limit — see barsGlyph.
@@ -1009,27 +1000,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return dataStale ? muted(.systemYellow) : nil
     }
 
-    // Show each installed agent's tightest window explicitly. The earlier
-    // single number showed Claude until another tool became hot, so a Codex
-    // or agy quota could change invisibly while still below the warning line.
-    // The dropdown keeps each tool's full window breakdown and reset times.
-    private func statusTitle() -> (String, NSColor) {
+    // Show every provider in words. The dropdown keeps each tool's full window
+    // breakdown and reset times; this is the one unambiguous glanceable value.
+    private func statusTitle(dimForFreshness: Bool) -> NSMutableAttributedString {
         let claudeLimits = [stats.session, stats.weekly, stats.scoped]
         let claudeWorst = stats.ok ? claudeLimits.max {
             (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct)
         } : nil
-        var parts = ["Cl\(claudeWorst.map { String($0.pct) } ?? "—")"]
-        var worst = claudeWorst
-        for tool in tools {
-            let tag = tool.name == "Codex" ? "Cd" : "Ag"
-            let reading = tool.ok ? tool.worst : nil
-            parts.append("\(tag)\(reading.map { String($0.pct) } ?? "—")")
-            if let reading, worst == nil || (alertLevel(reading), reading.pct) >
-                (alertLevel(worst!), worst!.pct) { worst = reading }
+        let readings: [(String, Limit?)] = [
+            ("Claude", claudeWorst),
+            ("Codex", tools.first(where: { $0.name == "Codex" && $0.ok })?.worst),
+            ("agy", tools.first(where: { $0.name == "Antigravity" && $0.ok })?.worst),
+        ]
+        let title = NSMutableAttributedString()
+        for (index, entry) in readings.enumerated() {
+            if index > 0 { title.append(barText(" · ", .secondaryLabelColor)) }
+            let value = entry.1.map { " \($0.pct)%" } ?? " —"
+            let color: NSColor
+            if dimForFreshness {
+                color = .secondaryLabelColor
+            } else {
+                color = entry.1.map { alertLevel($0) == .normal ? NSColor.labelColor : gaugeColor($0, 0) }
+                    ?? .secondaryLabelColor
+            }
+            title.append(barText(entry.0 + value, color))
         }
-        let color: NSColor = dataStale || collectorSick ? .secondaryLabelColor
-            : (worst.flatMap { alertLevel($0) == .normal ? nil : gaugeColor($0, 0) } ?? .labelColor)
-        return (parts.joined(separator: " "), color)
+        return title
     }
 
     // MARK: Menu (rebuilt at open, so ages are computed when eyes are on them)
@@ -1046,6 +1042,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
+        addHeader(menu, "Quota used")
         // EVERY section names its tool, including this one. This is a meter for
         // several agents now, and a section that is unambiguous only by
         // accident is not a design -- it was unnamed while Claude was the only
