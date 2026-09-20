@@ -66,13 +66,12 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** the 16 pt glyph stacks Claude's three windows, then
-one bar for Codex and one for agy when they report a number. The adjacent text
-shows each installed agent's tightest percentage (`Cl42 Cd16 Ag61`); a dash
-means that agent has not reported a quota yet. This makes every agent visible
-before a warning threshold is crossed. Orange means at least 75% used; red
-means at least 90%. A dot on the glyph marks stale data (yellow) or repeated
-collector failures (red). Click for individual windows and reset times.
+**In the menu bar:** the label says exactly what quota is used: `Claude 42% · Codex
+16% · agy 61%`. Every provider stays visible; a dash means it has not reported
+a quota yet. Orange means that provider is at least 75% used and red means that
+provider is at least 90% used, so one hot quota never makes every percentage
+look urgent. The tooltip also names stale data or a collector problem. Click
+for individual windows and reset times.
 
 **In the dropdown:** one section per installed tool, in a fixed order, each
 with the same four parts in the same places, so the eye learns one layout:
@@ -119,39 +118,10 @@ single-window plan is composed differently from a multi-window one — is
 [docs/design.md](docs/design.md), written before the code so the code can be
 checked against it.
 
-### Why the glyph is shaped that way
-
-| | Claude alone | Claude + Codex | Codex hot | Five bars |
-|---|---|---|---|---|
-| dark | ![](docs/menu-bar/claude-only-dark.png) | ![](docs/menu-bar/claude-codex-dark.png) | ![](docs/menu-bar/codex-hot-dark.png) | ![](docs/menu-bar/five-bars-dark.png) |
-| light | ![](docs/menu-bar/claude-only-light.png) | ![](docs/menu-bar/claude-codex-light.png) | ![](docs/menu-bar/codex-hot-light.png) | ![](docs/menu-bar/five-bars-light.png) |
-| | session, week, per-model cap; 2.600 pt bars | a fourth bar, the other tool's worst window, after a wider gap; 2.508 pt | the fourth bar red, and the number beside it reads `cdx 96%` | 1.956 pt bars, and the item is still 16 pt wide |
-
-Both appearances, because a glyph that survives one and vanishes in the other
-is a defect and this one did: see [Contrast](docs/contrast.md). Rendered by the
-app itself — `UsageMeter --glyph <out.png> --bars 27,98,76,42 --appearance
-light` — rather than photographed off a menu bar, which can only ever show the
-appearance the machine is currently in.
-
-Captured from the running app at 2x and cropped to the glyph. The item is 16 pt
-wide in all four.
-
-With more than one tool installed, a meter that shows only Claude is not a
-meter: a Codex window at 96% would be invisible until somebody opened the menu.
-Two other shapes were considered for the 16 px item and both lost.
-
-- **One bar for the tightest window across every tool, with a letter saying
-  whose.** On the commonest Mac — Claude alone — it throws away two of the
-  three limits that are legible there today, to solve a problem that Mac does
-  not have; and it puts a glyph, a letter and a number in 16 px, which is three
-  things competing for one glance.
-- **One bar per tool, uniformly.** The same objection in a weaker form: with
-  one tool installed it is a single bar where three fit. What ships *is* this,
-  for every tool except the one the app is named for — the only tool whose
-  per-window detail the item already has room for.
-- **Rotating between tools** was rejected outright. A value that changes while
-  nothing changed is noise, and a meter that is sometimes showing you the other
-  tool is one you cannot read at a glance.
+The menu bar deliberately uses words instead of a miniature chart: the menu is
+where each provider's individual windows, gauges and reset times belong. A
+single line of named percentages remains readable on a tinted menu bar and is
+understandable without learning a glyph.
 
 One Mac can hold more than one Claude Code identity — a personal account and a
 work account, say. The meter reads all of them and shows the one you are
@@ -170,8 +140,8 @@ Two pieces, and a launchd agent that keeps the app running.
   adds a key per other agentic CLI it finds installed, and none for one it does
   not.
 - **`Sources/main.swift`**, the app, runs the collector every 30 seconds (and at
-  wake, and whenever the menu is opened), draws the glyph and the number, and
-  rebuilds the dropdown every time it opens.
+  wake, and whenever the menu is opened), draws the named menu-bar percentages,
+  and rebuilds the dropdown every time it opens.
 
 The app never touches the network or the keychain, and the collector never draws
 anything. Neither writes to Claude Code's own files.
@@ -335,7 +305,7 @@ module, another launcher — depends on these three things and nothing else.
 |---|---|
 | `UsageMeter` | Runs the menu-bar app. Terminates any other running instance of the same bundle id first. |
 | `UsageMeter --run <program> [args…]` | Spawns the program as a child, waits, exits with its status. Never draws a menu-bar item. |
-| `UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light\|dark]` | Renders the menu-bar glyph to a PNG and exits, so the images in this README can be regenerated in either appearance without photographing somebody's menu bar. |
+| `UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light\|dark]` | Renders a legacy gauge asset to a PNG and exits. It does not affect the live menu-bar label. |
 
 **Collector output** — `usage-meter-stats` prints one JSON object on stdout:
 
@@ -381,8 +351,8 @@ It reads one key per other tool — today only `codex` — and, inside it:
 | `fetch_err`, `retry_in` | string, int | Why the live read is down and when it is tried again. Absent when it is up. |
 | `limits` | array | One object per usage window, in the tool's own order: `label` (string, what the window is), `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity`. An `ok` section with an empty `limits` is treated as not ok. |
 | `details` | array of strings | Facts that are not percentages, already worded by the collector, printed under the bars. The collector owns the words and the app owns the drawing, so a new fact is one line there and none here. |
-| `tag` | string | The short form the menu bar has room for when this tool's window is the hottest on the machine and takes the number over (`cdx`). Defaults to the first three letters of the name. |
-| `footnote` | bool | True for a tool that is installed but has no number to give. It is drawn as ONE line after the sections, contributes no bar to the glyph and never claims the number. `note` carries what the line says. |
+| `tag` | string | Retained for compatibility with older collectors; the live menu bar uses the provider's full name. |
+| `footnote` | bool | True for a tool that is installed but has no number to give. It is drawn as ONE line after the sections; its menu-bar value is a dash. `note` carries what the line says. |
 
 Which tools the app knows how to name, and in what order, is one table in
 `main.swift` (`toolNames`). A key not in it is ignored; a tool in it whose key
@@ -545,9 +515,8 @@ running to 2026-11-21. Re-read before relying on any figure here.
 3. help.openai.com/en/articles/9793128, "About ChatGPT Pro tiers" — read 2026-09-21, stamped ≈2026-09-19.
 4. help.openai.com/en/articles/20001106, "ChatGPT Rate Card" — read 2026-09-21, stamped ≈2026-09-18.
 
-Nothing about Codex reaches the menu-bar glyph or the number beside it. Those
-are Claude Code's three limits, and a fourth or fifth bar would break the one
-thing the glyph says.
+Codex's tightest reported window appears in the named menu-bar label alongside
+Claude and agy. Its detailed windows stay in the Codex menu section.
 
 #### Antigravity (`agy`) — status-line quota bridge
 
@@ -655,14 +624,9 @@ expected: it is the system noticing the binary is genuinely different.
 
 ### Colour
 
-Everything **drawn** — the glyph, the badge dot, the dropdown gauges and the
-graph — uses muted variants of the system colours: each is blended 38% toward
-mid-grey. A menu-bar meter sits beside monochrome template icons, where full
-saturation reads as an alarm, and a meter is furniture, not an alert box.
-Severity red and orange go through the same blend, because the **mark** carries
-the alarm — the badge dot, the label that appears beside a hot number — and
-colour only names it. Menu **text** keeps the stock system colours: those rows
-are ordinary UI, where the system palette is the convention.
+Dropdown gauges and the graph use muted variants of the system colours: each is
+blended 38% toward mid-grey. The menu-bar label uses the system text palette;
+only the provider whose quota is warning or critical turns orange or red.
 
 If you extend this app, keep that rule. It is the single instruction that makes
 the meter look like part of the menu bar rather than a notification.
