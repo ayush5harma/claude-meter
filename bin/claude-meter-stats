@@ -77,7 +77,7 @@ export PATH
 # future edit from balancing apostrophes.
 py_out="$(mktemp)"
 python3 - <<'PY' >"$py_out" 2>/dev/null
-import json, pathlib, datetime, hashlib, math, os, queue, shutil, subprocess, threading, time
+import json, pathlib, datetime, hashlib, math, os, queue, shutil, signal, subprocess, threading, time
 from collections import namedtuple
 
 HOME = pathlib.Path.home()
@@ -112,6 +112,23 @@ DEFAULT_SCOPED_LABEL = "Model"
 # a few tens of KB.
 HISTORY_MIN_INTERVAL = 600
 HISTORY_MAX_ROWS = 2000
+
+
+def write_private(path, text):
+    """Write a cache file that is 0600 from the moment it exists.
+
+    write_text() creates at the process umask and a chmod afterwards leaves a
+    window -- brief, and inside a 0700 directory, so this is order rather than
+    exposure, but there is no reason for the order to be wrong (PR review,
+    2026-09-20)."""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "w") as handle:
+            handle.write(text)
+    except Exception:
+        os.close(fd)
+        raise
+    os.chmod(path, 0o600)   # an EXISTING file keeps its old mode through O_CREAT
 
 
 def load_json(path):
@@ -386,9 +403,8 @@ def save_api_cache(identity, data):
         # usage response. Nothing here is a credential, but it is this user's
         # data and no other account on the Mac needs it.
         CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-        API_CACHE.write_text(json.dumps(
+        write_private(API_CACHE, json.dumps(
             {"account": identity.label, "email": identity.email, "fetched_at": NOW, "data": data}))
-        os.chmod(API_CACHE, 0o600)
         if BACKOFF.exists():
             BACKOFF.unlink()
     except Exception:
@@ -506,17 +522,21 @@ def append_history(label, limits):
 # 2026-09-20 against codex-cli 0.154.0 signed in with a ChatGPT account: the
 # five sqlite databases under $CODEX_HOME hold threads, logs, goals, memories
 # and a queue and no rate-limit table between them; `codex doctor` reports
-# thirty-odd facts about the install and not one number about usage; and the
-# rollout JSONL files that DO carry a `rate_limits` record are written only
-# while a session runs, so a Mac that has not run codex today has nothing on
-# disk to read at all. Grepping the whole of $CODEX_HOME for a rate-limit
-# string found one hit, in an unrelated plugin catalogue.
+# thirty-odd facts about the install and not one number about usage; and there
+# were no rollout files to read at all -- `codex doctor` counted "active
+# rollouts 0 files" and "rollout DB rows 0", and $CODEX_HOME/sessions did not
+# exist, because rollouts are written only while a session runs. (The 0.154.0
+# binary's symbols put `rate_limits` beside the rollout types, so a rollout of
+# a session that HAS run probably carries one -- not measured, and it would
+# still be as old as the last session either way.) Grepping the whole of
+# $CODEX_HOME for a rate-limit string found one hit, in an unrelated plugin
+# catalogue.
 #
 # WHAT IS READ INSTEAD. codex ships its own local JSON-RPC server -- `codex
 # app-server`, stdio, the same one its desktop app drives -- and two of its
 # methods are exactly this: `account/read` (plan and email, answered from
 # $CODEX_HOME alone, 0.03 s, no network) and `account/rateLimits/read` (the
-# usage read behind the TUI's `/status` panel, 0.79 s including its round trip).
+# usage read, 0.79 s including its round trip).
 # Neither is a model request, so neither spends any of the account's quota.
 #
 # THE CREDENTIAL STAYS CODEX'S. $CODEX_HOME/auth.json holds the account's
@@ -573,15 +593,25 @@ def codex_app_server(binary, calls):
     Spawn-and-kill on purpose: the server is ephemeral unless a daemon is asked
     for, it left no process and wrote no file in the probe this was built from,
     and a meter must not be the thing that starts a resident server nobody asked
-    for. Every read is under one deadline, and the child is killed in `finally`
-    whatever happens, so a hung server cannot outlive the poll that made it."""
+    for. Every read is under one deadline, and the whole process GROUP is killed
+    in `finally` whatever happens, so a hung server cannot outlive the poll that
+    made it.
+
+    The group, not the child, and that is not caution: killing the direct child
+    alone was measured leaving an orphan behind (PR review, 2026-09-20). A
+    `codex` that is a WRAPPER SCRIPT -- which the npm and Homebrew installs this
+    searches for can be, even though the binary on the machine this was built on
+    is a Mach-O -- launches the real server as a grandchild, and `kill` on the
+    wrapper reparents it to PID 1 still running. `start_new_session` puts the
+    whole thing in a group of its own so one signal ends it."""
     try:
         server = subprocess.Popen([binary, "app-server"],
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                  stderr=subprocess.DEVNULL, text=True, bufsize=1)
+                                  stderr=subprocess.DEVNULL, text=True, bufsize=1,
+                                  start_new_session=True)
     except Exception:
         return None
-    lines, answers = queue.Queue(), {}
+    lines, answers, never_started = queue.Queue(), {}, False
 
     def read_lines():
         try:
@@ -624,19 +654,39 @@ def codex_app_server(binary, calls):
                 answers[call_id] = message["result"]
             elif call_id in calls:
                 answers[call_id] = None    # an error reply: recorded as a miss, not a hang
+    except BrokenPipeError:
+        # The server was gone before it read the handshake: a codex too old to
+        # have `app-server`, or something on PATH named codex that is not codex.
+        # That is a failure to START, and saying so is the difference between
+        # "upgrade codex" and "something is wedged".
+        never_started = True
     except Exception:
         pass
     finally:
-        for close in (server.stdin.close, server.kill):
+        # Asked BEFORE the kill below, or every run would look like an exit. A
+        # child that ended on its OWN without answering did not start, whatever
+        # the pipe did -- the handshake is ~400 bytes and lands in the buffer
+        # before a fast-exiting child is reaped, so that write succeeds and
+        # BrokenPipeError never fires (measured 2026-09-20 with a `codex` that
+        # exits 1 at once). A genuinely wedged server is still running here.
+        if not answers and server.poll() is not None:
+            never_started = True
+        try:
+            server.stdin.close()
+        except Exception:
+            pass
+        try:
+            os.killpg(os.getpgid(server.pid), signal.SIGKILL)
+        except Exception:
             try:
-                close()
+                server.kill()      # already reaped, or no group to signal
             except Exception:
                 pass
         try:
             server.wait(timeout=2)
         except Exception:
             pass
-    return answers
+    return None if never_started else answers
 
 
 def codex_is_running():
@@ -646,6 +696,20 @@ def codex_is_running():
         return found.returncode == 0 and bool(found.stdout.strip())
     except Exception:
         return False
+
+
+def codex_int(value):
+    """An int from a JSON field, or None when the field is not one.
+
+    Every number below arrives from a server this script does not control, and
+    an int() or an arithmetic on a string raises out of codex_section into
+    main's blanket except, which DROPS the whole codex key -- the section
+    flickering in and out of the menu instead of saying what is wrong (PR
+    review, 2026-09-20). Booleans are rejected because `True` is an int in
+    Python and 100% is not what `usedPercent: true` means."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
 
 
 def codex_window_label(minutes):
@@ -679,10 +743,13 @@ def codex_limits(rate_limits):
         window = rate_limits.get(key)
         if not isinstance(window, dict):
             continue
-        resets_at = window.get("resetsAt")
+        used = codex_int(window.get("usedPercent"))
+        if used is None:
+            continue          # a window with no percentage is not a window
+        resets_at = codex_int(window.get("resetsAt"))
         limits.append({
-            "label": codex_window_label(window.get("windowDurationMins")),
-            "pct": int(window.get("usedPercent") or 0),
+            "label": codex_window_label(codex_int(window.get("windowDurationMins"))),
+            "pct": used,
             # An epoch-seconds instant here, where the Claude side gets an ISO
             # string; both become seconds-from-now, and a lapsed one becomes 0
             # rather than a negative countdown.
@@ -720,7 +787,13 @@ def codex_fetch(binary):
     rate_limits = usage.get("rateLimits")
     if not isinstance(rate_limits, dict):
         return None, "shape"
-    account = (answers.get(1) or {}).get("account") or {}
+    # A JSON-RPC `result` is whatever the server sent; only an object has
+    # `.get`, and the account read is the optional half of this -- a bad one
+    # must cost the section its email, never its numbers.
+    account = answers.get(1)
+    account = (account.get("account") if isinstance(account, dict) else None) or {}
+    if not isinstance(account, dict):
+        account = {}
     return {"email": account.get("email") or "",
             "plan": rate_limits.get("planType") or account.get("planType") or "",
             "rate_limits": rate_limits}, None
@@ -744,9 +817,19 @@ def codex_section():
     reading, fetched_at = None, 0.0
     if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
         reading, fetched_at = cached["data"], float(cached.get("fetched_at") or 0)
-    ttl = int(os.environ.get("CODEX_USAGE_TTL", "0")) or \
-        (CODEX_TTL_WHILE_RUNNING if codex_is_running() else CODEX_TTL_WHILE_IDLE)
     in_backoff, fail_why, retry_in = codex_backoff_state()
+    # Which TTL applies depends on whether codex is running, and asking that
+    # forks a pgrep. A reading younger than the SHORTEST TTL that could apply is
+    # fresh whichever one it is, so the fork is only paid by a poll that might
+    # actually fetch -- 30 s ticks all day against a warm cache pay nothing
+    # (PR review, 2026-09-20). An explicit override IS the shortest TTL.
+    override = int(os.environ.get("CODEX_USAGE_TTL", "0") or 0)
+    floor = override if override > 0 else CODEX_TTL_WHILE_RUNNING
+    if (reading is None or NOW - fetched_at >= floor) and not in_backoff:
+        ttl = override or \
+            (CODEX_TTL_WHILE_RUNNING if codex_is_running() else CODEX_TTL_WHILE_IDLE)
+    else:
+        ttl = floor
     if (reading is None or NOW - fetched_at >= ttl) and not in_backoff:
         fresh, err = codex_fetch(binary)
         if fresh:
@@ -754,8 +837,8 @@ def codex_section():
             fail_why, retry_in = "", 0
             try:
                 CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
-                CODEX_CACHE.write_text(json.dumps({"fetched_at": NOW, "data": fresh}))
-                os.chmod(CODEX_CACHE, 0o600)   # the account's email, nobody else's business
+                # 0600: the account's email, nobody else's business.
+                write_private(CODEX_CACHE, json.dumps({"fetched_at": NOW, "data": fresh}))
                 if CODEX_BACKOFF.exists():
                     CODEX_BACKOFF.unlink()
             except Exception:

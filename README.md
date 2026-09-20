@@ -366,8 +366,9 @@ item, to the menu before that tool was ever supported.
 
 #### Codex — supported
 
-[Codex CLI](https://developers.openai.com/codex/cli) reports the quota behind
-its own `/status` panel, and the meter reads it the way Codex itself does.
+[Codex CLI](https://developers.openai.com/codex/cli) will not tell you its quota
+from a file, but it will answer for it — the meter asks Codex's own local server
+the question Codex's own UI asks.
 
 - **Detected by** a `codex` executable — `PATH` first, then `~/.local/bin`,
   `/run/current-system/sw/bin`, `/etc/profiles/per-user/$USER/bin`,
@@ -382,7 +383,10 @@ its own `/status` panel, and the meter reads it the way Codex itself does.
   `account/rateLimits/read` (the usage read, with `excludeResetCreditDetails`,
   which the method's own schema describes as the shape for background usage
   polls). Neither is a model request, so neither spends any quota. The server is
-  spawned per read and killed in a `finally`; it leaves no process and writes no
+  spawned per read, and the whole process *group* is killed in a `finally` —
+  the group rather than the child because a `codex` that is a wrapper script
+  launches the real server as a grandchild, and killing the wrapper alone was
+  measured leaving that grandchild running. It leaves no process and writes no
   file.
 - **The credential stays Codex's.** `$CODEX_HOME/auth.json` holds the account's
   OAuth tokens and the meter never opens it — it is checked for *existence*, to
@@ -560,11 +564,14 @@ The dates in the code comments are what each rule came from. The short version:
 - **2026-09-20, where Codex keeps its quota — and where it does not.** The five
   sqlite databases under `$CODEX_HOME` hold threads, logs, goals, memories and a
   queue, and no rate-limit table between them. `codex doctor` reports thirty-odd
-  facts about the install and not one number about usage. The rollout files that
-  *do* carry a `rate_limits` record are written only while a session runs, so a
-  Mac that has not run Codex today has nothing on disk to read. Grepping all of
-  `$CODEX_HOME` for a rate-limit string returned one hit, in an unrelated plugin
-  catalogue. `codex app-server` answered `account/rateLimits/read` in 0.79 s and
+  facts about the install and not one number about usage. There were no rollout
+  files to read either — `codex doctor` counted "active rollouts 0 files" and
+  "rollout DB rows 0", and `$CODEX_HOME/sessions` did not exist, because
+  rollouts are written only while a session runs. (The binary's symbols put
+  `rate_limits` beside the rollout types, so a rollout of a session that *has*
+  run probably carries one; not measured, and it would be as old as the last
+  session either way.) Grepping all of `$CODEX_HOME` for a rate-limit string
+  returned one hit, in an unrelated plugin catalogue. `codex app-server` answered `account/rateLimits/read` in 0.79 s and
   `account/read` in 0.03 s, and left no process and no file behind.
 - **2026-09-20, the window has no fixed name.** The account this was built
   against reports a single 43200-minute (30-day) primary window on a free plan,
