@@ -4,9 +4,12 @@
 # this Mac that can report its own quota locally.
 #
 # PRESENCE-GATED, ALWAYS. A tool that is not installed contributes no key at
-# all, so the blob -- and therefore the menu -- is byte-identical to what it was
-# before that tool was supported. Nothing prints an empty row or an error for a
-# binary nobody has.
+# all, so the blob carries the same keys and the same values it carried before
+# that tool was supported, and the menu drawn from it is identical row for row.
+# (The blob is not byte-identical: `ts` and the outer object are now serialised
+# by the same json.dumps as everything else, which spaces them. Nothing reads
+# this as text.) Nothing prints an empty row or an error for a binary nobody
+# has.
 #
 # THE NUMBERS ARE REAL, NOT DERIVED. Claude Code caches the account's actual
 # rate-limit utilisation -- what `/usage` shows -- in `cachedUsageUtilization`
@@ -827,8 +830,8 @@ def claude_section():
 
 def main():
     # `claude` is always emitted; every other tool contributes a key ONLY when
-    # it is installed, so the blob a Mac with neither produces is byte-identical
-    # to the one this script produced before either was supported. A section
+    # it is installed, so the blob a Mac with neither produces carries the same
+    # keys and values this script produced before either was supported. A section
     # that raises is dropped rather than taking the whole blob down with it --
     # the Claude reading is what this app exists for and must survive a second
     # tool misbehaving.
