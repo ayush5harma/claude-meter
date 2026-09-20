@@ -1,4 +1,4 @@
-// Claude Meter — one menu-bar item showing the Claude account's real rate-limit
+// Usage Meter — one menu-bar item showing the Claude account's real rate-limit
 // utilisation: the 5-hour session window, the weekly all-models window and the
 // weekly premium-model ("scoped") window, each against its real ceiling.
 //
@@ -46,13 +46,13 @@
 // contributes one line rather than a section that could only ever say "no
 // data". The collector decides which; this file draws what it is given.
 //
-// IT COLLECTS NO DATA ITSELF. bin/claude-meter-stats emits the JSON.
+// IT COLLECTS NO DATA ITSELF. bin/usage-meter-stats emits the JSON.
 
 import AppKit
 
 // MARK: - CLI mode — run a command under this app's identity
 //
-// `ClaudeMeter --run <program> [args…]` runs the program as a CHILD of this
+// `UsageMeter --run <program> [args…]` runs the program as a CHILD of this
 // binary and waits for it. The point is macOS's per-app privacy model: TCC
 // grants (Full Disk Access, Files and Folders, Automation) are keyed to the
 // RESPONSIBLE process, and a launchd job's responsible process is its own
@@ -71,7 +71,7 @@ import AppKit
 var cliChild: Process?
 func runUnderThisIdentity(_ argv: [String]) -> Never {
     guard let program = argv.first, !program.isEmpty else {
-        FileHandle.standardError.write(Data("usage: ClaudeMeter --run <program> [args…]\n".utf8))
+        FileHandle.standardError.write(Data("usage: UsageMeter --run <program> [args…]\n".utf8))
         exit(64)
     }
     let child = Process()
@@ -86,11 +86,67 @@ func runUnderThisIdentity(_ argv: [String]) -> Never {
     signal(SIGTERM) { _ in cliChild?.terminate() }
     signal(SIGINT) { _ in cliChild?.interrupt() }
     do { try child.run() } catch {
-        FileHandle.standardError.write(Data("ClaudeMeter: cannot run \(program): \(error)\n".utf8))
+        FileHandle.standardError.write(Data("UsageMeter: cannot run \(program): \(error)\n".utf8))
         exit(126)
     }
     child.waitUntilExit()
     exit(child.terminationStatus)
+}
+
+// MARK: - CLI mode — render the glyph to a file
+//
+// `UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light|dark]`
+// draws the menu-bar glyph and exits. It exists because the images in the
+// README and docs/ have to be regenerated whenever the design moves, and
+// driving the real menu bar with AppleScript to photograph it is a worse way
+// to get them: it can only ever produce the appearance the machine is
+// currently in, so the LIGHT one could not be checked at all without changing
+// a setting on somebody's Mac.
+//
+// The bars are given explicitly rather than collected, so an image in the
+// documentation shows what it says it shows, and they are clamped to 0-100
+// because a percentage is not a free integer.
+//
+// Dispatched at the BOTTOM of this file, unlike `--run` -- see the comment
+// there for why the two are on opposite sides of the globals.
+func renderGlyph(_ argv: [String]) -> Never {
+    var out = "", bars = [27, 98, 76], appearanceName = "dark"
+    var rest = argv[...]
+    if let first = rest.first, !first.hasPrefix("--") { out = first; rest = rest.dropFirst() }
+    while let flag = rest.first {
+        rest = rest.dropFirst()
+        guard let value = rest.first else { break }
+        rest = rest.dropFirst()
+        switch flag {
+        case "--bars": bars = value.split(separator: ",").compactMap { Int($0) }
+        case "--appearance": appearanceName = value
+        case "--out": out = value
+        default: break
+        }
+    }
+    guard !out.isEmpty, !bars.isEmpty else {
+        FileHandle.standardError.write(Data(
+            "usage: UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light|dark]\n".utf8))
+        exit(64)
+    }
+    // AppKit needs its shared application before anything can be drawn into an
+    // image: without it `lockFocus` fails with "size zero" on an image whose
+    // size is plainly not zero (measured 2026-09-21). `.prohibited` keeps this
+    // out of the Dock and out of the status bar -- a render is not a launch.
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    NSAppearance.current = NSAppearance(named: appearanceName == "light" ? .aqua : .darkAqua)
+    let limits = bars.map { Limit(pct: max(0, min(100, $0))) }
+    let image = barsGlyph(limits, groupAfter: limits.count > 3 ? 3 : 0)
+    guard let tiff = image.tiffRepresentation,
+          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+        FileHandle.standardError.write(Data("UsageMeter: could not encode the glyph\n".utf8))
+        exit(70)
+    }
+    do { try png.write(to: URL(fileURLWithPath: out)) } catch {
+        FileHandle.standardError.write(Data("UsageMeter: cannot write \(out): \(error)\n".utf8))
+        exit(73)
+    }
+    exit(0)
 }
 
 let cliArgs = Array(CommandLine.arguments.dropFirst())
@@ -100,10 +156,12 @@ if cliArgs.first == "--run" { runUnderThisIdentity(Array(cliArgs.dropFirst())) }
 // MARK: - Paths
 
 // The collector's cache directory, the only place outside the collector this
-// app reads. It does NOT follow CLAUDE_METER_CACHE_DIR, which the collector
+// app reads. It does NOT follow USAGE_METER_CACHE_DIR, which the collector
 // does: point that elsewhere and the dropdown's history graph goes empty.
+// The collector migrates ~/.cache/claude-meter to this path on its first run
+// after the rename, so the app only ever needs to know the new one.
 let cacheDir = FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent(".cache/claude-meter")
+    .appendingPathComponent(".cache/usage-meter")
 
 // MARK: - Model
 
@@ -180,6 +238,20 @@ func formatCountdown(_ seconds: Int) -> String {
     return h > 0 ? "\(d)d\(h)h" : "\(d)d"
 }
 
+// The same span written out for a SENTENCE rather than for a column. "29d23h"
+// is right where it has to line up under another countdown and wrong where it
+// is read as prose, which is where the single-window block puts it.
+func formatSpan(_ seconds: Int) -> String {
+    if seconds <= 0 { return "" }
+    if seconds < 3600 { return "\(max(1, seconds / 60)) min" }
+    if seconds < 86400 {
+        let h = seconds / 3600, m = (seconds % 3600) / 60
+        return m > 0 ? "\(h)h \(m)m" : "\(h)h"
+    }
+    let d = seconds / 86400, h = (seconds % 86400) / 3600
+    return h > 0 ? "\(d)d \(h)h" : "\(d)d"
+}
+
 // Relative age for the dropdown, e.g. "8s ago" / "3m ago" / "2.4h ago".
 func formatAge(_ seconds: Int) -> String {
     if seconds < 0 { return "never" }
@@ -190,19 +262,119 @@ func formatAge(_ seconds: Int) -> String {
     return "\(seconds / 86400)d ago"
 }
 
+// MARK: - The scale
+//
+// Four type sizes and one set of metrics, named once so a change is one number
+// and so the code can be checked against docs/design.md rather than against
+// itself. Monospaced digits everywhere a number is drawn: a percentage ticking
+// from 9% to 10% must not shift the column it sits in.
+enum Type {
+    // Relative to the system font size rather than absolute, so a Mac
+    // configured with a larger one gets a proportionally larger dropdown.
+    //
+    // Measured 2026-09-21: NSFont.systemFontSize is 13 by default here, and
+    // AppKit does NOT scale systemFont(ofSize:) with the Accessibility text
+    // size -- NSFont.preferredFont(forTextStyle:) is the API that does, and
+    // adopting it would mean re-deriving every metric below from what it
+    // returns. So this closes the half that is free, and the other half is a
+    // known gap rather than an unknown one.
+    static let scale = NSFont.systemFontSize / 13
+    static let identity: CGFloat = 12.5 * scale   // "Codex · you@example.com · pro"
+    static let figure: CGFloat = 13 * scale       // the percentage, one number per row
+    static let label: CGFloat = 12 * scale        // the window's name
+    static let body: CGFloat = 11.5 * scale       // source and age, details, footnotes
+    static let caption: CGFloat = 11 * scale      // the countdown
+    static let tick: CGFloat = 8 * scale          // the graph's axis
+}
+
+enum Metric {
+    // Scaled by the same factor as the type, because a row is a box around
+    // text: scaling only the type grew the words inside a container that did
+    // not, which the first cut did (PR review, 2026-09-21). The gutter is the
+    // one exception -- a margin is whitespace, not a container, and it reads
+    // the same at any size.
+    static let contentWidth: CGFloat = 340 * Type.scale
+    static let gutter: CGFloat = 16
+    static let row: CGFloat = 28 * Type.scale       // one window row
+    static let bar: CGFloat = 12 * Type.scale       // its gauge
+    static let soloBlock: CGFloat = 56 * Type.scale // a section with one window
+    static let soloBar: CGFloat = 14 * Type.scale
+    static let percentColumn: CGFloat = 40 * Type.scale
+    static let countdownColumn: CGFloat = 52 * Type.scale
+    static let graph: CGFloat = 60 * Type.scale
+    static let labelColumnMin: CGFloat = 60 * Type.scale
+    static let labelColumnMax: CGFloat = 120 * Type.scale
+}
+
 // MARK: - Colour
 
-// Everything DRAWN in the bar (the bars glyph, the badge — and the dropdown
-// gauges and graph, which share the same series colours) uses MUTED variants of
-// the system colours: full-saturation system colours shout next to the bar's
-// monochrome template icons, and a meter is furniture, not an alert box.
-// Blending ~a third of the chroma toward mid-grey keeps every hue nameable in a
-// light or dark bar without the neon look; severity red/orange pass through the
-// same blend because the MARK (the badge dot, the exclaimed number) carries the
-// alarm — colour only names it. Menu TEXT keeps stock system colours: those
-// rows are standard UI where the system palette is the convention.
+// WCAG 2.1 relative luminance, so the palette can check itself rather than be
+// trusted. Every drawn thing here is a graphical object, whose floor is 3:1.
+func relativeLuminance(_ c: NSColor) -> CGFloat {
+    guard let rgb = c.usingColorSpace(.sRGB) else { return 0 }
+    func channel(_ v: CGFloat) -> CGFloat {
+        v <= 0.03928 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+    }
+    return 0.2126 * channel(rgb.redComponent) + 0.7152 * channel(rgb.greenComponent)
+        + 0.0722 * channel(rgb.blueComponent)
+}
+
+func contrastRatio(_ a: NSColor, _ b: NSColor) -> CGFloat {
+    let (x, y) = (relativeLuminance(a), relativeLuminance(b))
+    return (max(x, y) + 0.05) / (min(x, y) + 0.05)
+}
+
+// The gauge track as it is actually seen: quaternaryLabelColor is mostly alpha,
+// so what a fill sits on is that colour composited over the bar. Measured with
+// test/contrast on 2026-09-21: #353535 on a dark bar, #DBDBDB on a light one.
+// Named here as the surface the mute below has to clear.
+let trackSurface: [Bool: CGFloat] = [true: 0.208, false: 0.859]
+
+// MUTED, AND IT CHECKS ITSELF.
+//
+// Everything DRAWN uses a muted variant of a system colour: full-saturation
+// system colours shout next to the bar's monochrome template icons, and a meter
+// is furniture, not an alert box. Menu TEXT keeps the stock system colours,
+// because those rows are standard UI.
+//
+// Three things make this dynamic rather than a constant:
+//
+//  1. It resolves when it is DRAWN. `seriesColors` is a `let` at file scope, so
+//     a colour blended once would freeze whatever appearance the app launched
+//     into and never follow a switch to the other one.
+//  2. The blend TARGET follows the appearance. Muting toward a light grey pulls
+//     a shouting colour back toward the furniture on a DARK bar; on a light one
+//     it lightens an already-light colour until it vanishes into the track.
+//  3. It then keeps going until it clears 3:1 against that track, because
+//     muting and legibility pull in opposite directions and legibility wins.
+//     Measured 2026-09-21 against a fixed 0.58 blend: in the light appearance
+//     every fill fell under 3:1 and the health badge reached 1.25:1, which is
+//     not a badge. The cap at 0.7 stops a colour that cannot get there from
+//     going to pure black or white; nothing in the current palette hits it.
 func muted(_ c: NSColor) -> NSColor {
-    c.blended(withFraction: 0.38, of: NSColor(calibratedWhite: 0.58, alpha: 1)) ?? c
+    NSColor(name: nil) { appearance in
+        // "Increase contrast" is the user saying, in the system's own words,
+        // that they do not want de-emphasis. Muting is exactly that, so it is
+        // dropped and the full-strength system colour is used instead.
+        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast { return c }
+        let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) != .aqua
+        let neutral = NSColor(calibratedWhite: isDark ? 0.58 : 0.34, alpha: 1)
+        let away = NSColor(calibratedWhite: isDark ? 1 : 0, alpha: 1)
+        // sRGB, not calibratedWhite: the two grey spaces differ by enough
+        // gamma that the same number resolves to a different luminance, and
+        // the loop was clearing its own optimistic copy of the track while the
+        // real one measured 2.80:1 (2026-09-21).
+        let grey = trackSurface[isDark] ?? 0.5
+        let track = NSColor(srgbRed: grey, green: grey, blue: grey, alpha: 1)
+        let base = c.blended(withFraction: 0.38, of: neutral) ?? c
+        var result = base
+        var extra: CGFloat = 0
+        while contrastRatio(result, track) < 3, extra < 0.7 {
+            extra += 0.05
+            result = base.blended(withFraction: extra, of: away) ?? base
+        }
+        return result
+    }
 }
 
 // Per-limit ACCENT colour, Little Snitch style: the colour identifies which
@@ -351,10 +523,7 @@ final class UsageView: NSView {
     // none forever, which reads as a promise the meter is not keeping.
     var drawsHistory = true
 
-    private static let rowHeight: CGFloat = 30
-    private static let graphHeight: CGFloat = 60
-    private let pad: CGFloat = 14
-    private let graphHeight: CGFloat = UsageView.graphHeight
+    private let pad = Metric.gutter
 
     // The label column is as wide as this section's own widest label, and that
     // is not polish. It was 60 pt for everyone, which fits "Session", "Week"
@@ -365,31 +534,68 @@ final class UsageView: NSView {
     // and the menu was not, which is the whole argument for looking at it).
     // Clamped at both ends: 60 keeps the tight layout every section had before
     // this, and 120 stops one long label from leaving no room for the bar.
-    private static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    private static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: Type.label,
+                                                                    weight: .medium)
     private var labelColumn: CGFloat {
         let widest = limits.reduce(CGFloat(0)) {
             max($0, NSAttributedString(string: $1.0, attributes: [.font: UsageView.labelFont])
                 .size().width)
         }
-        return min(120, max(60, widest.rounded(.up) + 10))
+        return min(Metric.labelColumnMax, max(Metric.labelColumnMin, widest.rounded(.up) + 10))
     }
 
+    // ONE WINDOW IS NOT THREE WINDOWS. A plan with a single usage window must
+    // not read as a plan with three minus two: a free Codex account has exactly
+    // one fact worth having -- when it resets -- and one number that will say
+    // 0% for most of a month. So it gets its own composition (see
+    // `drawSoloWindow`) rather than one lonely row in a grid built for
+    // comparing several.
+    private var isSolo: Bool { limits.count == 1 && !drawsHistory }
+
     // The exact height this view needs, so a section is sized from its own
-    // content instead of from a constant that has to be re-guessed every time a
-    // tool with a different number of limits is added.
+    // content instead of from a constant re-guessed every time a tool with a
+    // different number of windows appears.
     static func height(rows: Int, history: Bool) -> CGFloat {
-        let rowsHeight = 10 + CGFloat(rows) * rowHeight
-        return history ? rowsHeight + 8 + graphHeight + 8 : rowsHeight + 8
+        if rows == 1 && !history { return 6 + Metric.soloBlock + 6 }
+        let rowsHeight = 6 + CGFloat(rows) * Metric.row
+        return history ? rowsHeight + 8 + Metric.graph + 8 : rowsHeight + 6
     }
 
     override func draw(_ dirty: NSRect) {
         NSGraphicsContext.current?.shouldAntialias = true
-        let belowRows = drawLimitRows(top: bounds.height - 10)
+        guard !isSolo else {
+            drawSoloWindow(top: bounds.height - 6)
+            return
+        }
+        let belowRows = drawLimitRows(top: bounds.height - 6)
         guard drawsHistory else { return }
-        let graphY = belowRows - 8 - graphHeight
+        let graphY = belowRows - 8 - Metric.graph
         guard graphY > 4 else { return }
         drawHistory(in: NSRect(x: pad + labelColumn, y: graphY,
-                               width: bounds.width - pad * 2 - labelColumn, height: graphHeight))
+                               width: bounds.width - pad * 2 - labelColumn, height: Metric.graph))
+    }
+
+    // The single-window composition: the window's name and its percentage on
+    // one line, a full-width bar under them, and the countdown spelled out as a
+    // sentence rather than abbreviated into a column that has nothing to line
+    // up with.
+    private func drawSoloWindow(top: CGFloat) {
+        guard let (name, limit) = limits.first else { return }
+        let width = bounds.width - pad * 2
+        var y = top - 14
+        drawText(name, .secondaryLabelColor, x: pad, centredOn: y,
+                 size: Type.label, weight: .medium, maxWidth: width - 70)
+        drawText("\(limit.pct)%",
+                 alertLevel(limit) != .normal ? gaugeColor(limit, 0) : .labelColor,
+                 x: bounds.width - pad, centredOn: y, size: Type.figure, weight: .semibold,
+                 rightAligned: true)
+        y -= 18
+        drawGauge(NSRect(x: pad, y: y - Metric.soloBar / 2, width: width, height: Metric.soloBar),
+                  pct: limit.pct, color: gaugeColor(limit, 0))
+        y -= 18
+        let resets = limit.resetIn > 0 ? "resets in \(formatSpan(limit.resetIn))"
+                                       : "no reset time reported"
+        drawText(resets, .secondaryLabelColor, x: pad, centredOn: y, size: Type.body)
     }
 
     // One row per limit: name, gauge, percentage, time to reset. Sized to be
@@ -397,25 +603,26 @@ final class UsageView: NSView {
     // percentages. The first cut used 7pt bars, whose fill at 20-30% was a
     // barely-visible stub. Returns the y the rows end at.
     private func drawLimitRows(top: CGFloat) -> CGFloat {
-        let rowHeight = UsageView.rowHeight, barHeight: CGFloat = 12
-        let percentColumn: CGFloat = 104
-        let gaugeWidth = bounds.width - pad * 2 - self.labelColumn - percentColumn
-        var y = top
         let labelColumn = self.labelColumn
+        let numbers = Metric.percentColumn + Metric.countdownColumn
+        let gaugeWidth = bounds.width - pad * 2 - labelColumn - numbers - 10
+        var y = top
         for (i, item) in limits.enumerated() {
             let (name, limit) = item
-            y -= rowHeight
-            let middle = y + rowHeight / 2
-            drawText(name, .secondaryLabelColor, x: pad, centredOn: middle, size: 12, weight: .medium,
-                     maxWidth: labelColumn - 6)
-            drawGauge(NSRect(x: pad + labelColumn, y: middle - barHeight / 2,
-                             width: gaugeWidth, height: barHeight),
+            y -= Metric.row
+            let middle = y + Metric.row / 2
+            drawText(name, .secondaryLabelColor, x: pad, centredOn: middle,
+                     size: Type.label, weight: .medium, maxWidth: labelColumn - 6)
+            drawGauge(NSRect(x: pad + labelColumn, y: middle - Metric.bar / 2,
+                             width: gaugeWidth, height: Metric.bar),
                       pct: limit.pct, color: gaugeColor(limit, i))
-            drawText("\(limit.pct)%", alertLevel(limit) != .normal ? gaugeColor(limit, i) : .labelColor,
-                     x: pad + labelColumn + gaugeWidth + 44, centredOn: middle,
-                     size: 13, weight: .semibold, rightAligned: true)
+            drawText("\(limit.pct)%",
+                     alertLevel(limit) != .normal ? gaugeColor(limit, i) : .labelColor,
+                     x: pad + labelColumn + gaugeWidth + 10 + Metric.percentColumn,
+                     centredOn: middle, size: Type.figure, weight: .semibold, rightAligned: true)
             drawText(formatCountdown(limit.resetIn), .secondaryLabelColor,
-                     x: bounds.width - pad, centredOn: middle, rightAligned: true)
+                     x: bounds.width - pad, centredOn: middle, size: Type.caption,
+                     rightAligned: true)
         }
         return y
     }
@@ -479,7 +686,7 @@ final class UsageView: NSView {
     // A row label or number: left-aligned at x, or right-aligned to it,
     // vertically centred on its row.
     private func drawText(_ s: String, _ color: NSColor, x: CGFloat, centredOn y: CGFloat,
-                          size: CGFloat = 11, weight: NSFont.Weight = .regular,
+                          size: CGFloat = Type.caption, weight: NSFont.Weight = .regular,
                           rightAligned: Bool = false, maxWidth: CGFloat? = nil) {
         var attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight),
@@ -515,7 +722,7 @@ final class UsageView: NSView {
     // placed from its own measured size.
     private func drawCaption(_ s: String, at place: (NSSize) -> NSPoint) {
         let text = NSAttributedString(string: s, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: Type.tick, weight: .regular),
             .foregroundColor: NSColor.tertiaryLabelColor,
         ])
         text.draw(at: place(text.size()))
@@ -543,13 +750,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // can be tested without installing, then the two usual bin directories.
     private static var collectorCandidates: [String] {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let environment = ProcessInfo.processInfo.environment
         var candidates: [String] = []
-        if let fromEnv = ProcessInfo.processInfo.environment["CLAUDE_METER_STATS"], !fromEnv.isEmpty {
-            candidates.append(fromEnv)
+        // Both spellings, new first, for one release: a config-management run
+        // pins a commit and deploys the OLD path, so the app has to find it
+        // there until that run moves. Same reason bin/ still carries a shim.
+        for name in ["USAGE_METER_STATS", "CLAUDE_METER_STATS"] {
+            if let fromEnv = environment[name], !fromEnv.isEmpty { candidates.append(fromEnv) }
         }
-        candidates.append("\(home)/.local/bin/claude-meter-stats")
-        candidates.append("/usr/local/bin/claude-meter-stats")
-        candidates.append("/opt/homebrew/bin/claude-meter-stats")
+        for directory in ["\(home)/.local/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
+            candidates.append("\(directory)/usage-meter-stats")
+            candidates.append("\(directory)/claude-meter-stats")
+        }
         return candidates
     }
 
@@ -592,11 +804,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // status item in the menu bar and everything appears twice. Each
         // instance draws its own item, so this is not a rendering bug and
         // cannot be fixed by drawing; the duplicate process has to go.
+        // The OLD bundle id is swept too, and that is the rename's own hazard
+        // rather than tidiness: the previous app is a DIFFERENT application to
+        // LaunchServices, so without this a Mac mid-upgrade shows two menu-bar
+        // items, each convinced it is the only one.
         let me = ProcessInfo.processInfo.processIdentifier
-        let others = NSRunningApplication.runningApplications(
-            withBundleIdentifier: Bundle.main.bundleIdentifier ?? "local.ayushsharma.claude-meter")
-            .filter { $0.processIdentifier != me }
-        for other in others { other.terminate() }
+        let identities = [Bundle.main.bundleIdentifier ?? "local.ayushsharma.usage-meter",
+                          "local.ayushsharma.claude-meter"]
+        for identity in Set(identities) {
+            for other in NSRunningApplication.runningApplications(withBundleIdentifier: identity)
+            where other.processIdentifier != me {
+                other.terminate()
+            }
+        }
 
         collectorPath = Self.collectorCandidates.first {
             FileManager.default.isExecutableFile(atPath: $0)
@@ -628,7 +848,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func refresh() {
         guard !collectorPath.isEmpty else {
-            lastError = "claude-meter-stats not found"
+            lastError = "usage-meter-stats not found"
             failStreak += 1
             render()
             return
@@ -761,7 +981,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func barText(_ s: String, _ c: NSColor) -> NSAttributedString {
         NSAttributedString(string: s, attributes: [
-            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium),
+            .font: NSFont.monospacedDigitSystemFont(ofSize: Type.label, weight: .medium),
             .foregroundColor: c,
         ])
     }
@@ -830,21 +1050,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
-        // The tool's NAME appears only when there is more than one section: a
-        // name that tells sections apart is not needed when there is one, so a
-        // Mac with only Claude reads exactly as it always has.
-        let named = !tools.filter { !$0.footnote }.isEmpty
-        let identity = stats.email.isEmpty ? "" : "\(stats.email) · \(stats.account)"
-        addHeader(menu, [named ? "Claude" : "", identity.isEmpty ? "Claude usage" : identity]
+        // EVERY section names its tool, including this one. This is a meter for
+        // several agents now, and a section that is unambiguous only by
+        // accident is not a design -- it was unnamed while Claude was the only
+        // thing here, and the rename is exactly when that stops being true.
+        addHeader(menu, ["Claude", stats.email.isEmpty ? "" : stats.email,
+                         stats.email.isEmpty ? "" : stats.account]
             .filter { !$0.isEmpty }.joined(separator: " · "))
         if haveStats, stats.ok {
             addFreshnessRows(menu)
-            let usage = UsageView(frame: NSRect(x: 0, y: 0, width: 340,
-                                                height: UsageView.height(rows: 3, history: true)))
-            usage.limits = [("Session", stats.session), ("Week", stats.weekly),
-                            (stats.scopedLabel, stats.scoped)]
-            usage.history = loadHistory()
-            let item = NSMenuItem(); item.view = usage; menu.addItem(item)
+            addUsageView(menu, limits: [("Session", stats.session), ("Week", stats.weekly),
+                                        (stats.scopedLabel, stats.scoped)],
+                         history: loadHistory(), drawsHistory: true)
         } else if haveStats {
             addNote(menu, "No usage data yet — sign in to Claude Code once")
         } else {
@@ -854,7 +1071,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         addAction(menu, "Refresh Now", #selector(doRefresh), key: "r")
         menu.addItem(.separator())
-        addAction(menu, "Quit Claude Meter", #selector(quit), key: "q")
+        addAction(menu, "Quit Usage Meter", #selector(quit), key: "q")
     }
 
     // One section per other agentic CLI the collector reported on. Nothing is
@@ -880,12 +1097,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             }
             // Rows only, no graph: no history is recorded for these tools, and
             // an empty plot under every one of them says nothing.
-            let usage = UsageView(frame: NSRect(
-                x: 0, y: 0, width: 340,
-                height: UsageView.height(rows: tool.limits.count, history: false)))
-            usage.limits = tool.limits
-            usage.drawsHistory = false
-            let item = NSMenuItem(); item.view = usage; menu.addItem(item)
+            addUsageView(menu, limits: tool.limits, history: [])
             // Under the bars, not above: the percentages are what the section
             // is for, and the model it is spending on is context for them.
             for detail in tool.details { addNote(menu, detail) }
@@ -898,6 +1110,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             menu.addItem(.separator())
             for tool in footnotes { addNote(menu, tool.note, color: .tertiaryLabelColor) }
         }
+    }
+
+    // The one place a section's bars are added, so every tool is drawn by the
+    // same view at the same width with the same anatomy. An empty `history`
+    // means no graph -- a tool that records none must not be given an empty
+    // plot that promises one.
+    private func addUsageView(_ menu: NSMenu, limits: [(String, Limit)],
+                              history: [HistoryPoint] = [], drawsHistory: Bool = false) {
+        guard !limits.isEmpty else { return }
+        let view = UsageView(frame: NSRect(
+            x: 0, y: 0, width: Metric.contentWidth,
+            height: UsageView.height(rows: limits.count, history: drawsHistory)))
+        view.limits = limits
+        view.history = history
+        view.drawsHistory = drawsHistory
+        let item = NSMenuItem()
+        item.view = view
+        menu.addItem(item)
     }
 
     // Same rule as the Claude section: the age shown is the age at collection
@@ -945,11 +1175,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func addHeader(_ menu: NSMenu, _ text: String) {
-        addTextRow(menu, text, font: .systemFont(ofSize: 12.5, weight: .semibold), color: .labelColor)
+        addTextRow(menu, text, font: .systemFont(ofSize: Type.identity, weight: .semibold),
+                   color: .labelColor)
     }
 
     private func addNote(_ menu: NSMenu, _ text: String, color: NSColor = .secondaryLabelColor) {
-        addTextRow(menu, text, font: .systemFont(ofSize: 11.5), color: color)
+        addTextRow(menu, text, font: .systemFont(ofSize: Type.body), color: color)
     }
 
     // Text-only action rows, like the system's own status menus. (SF Symbol
@@ -964,6 +1195,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func doRefresh() { refresh() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
+
+// AFTER every global, unlike `--run`, and the difference is the reason both
+// comments exist. This is main.swift, so globals are initialised in FILE ORDER
+// as top-level code runs, not lazily: dispatching a render from up beside
+// `--run` read `menuBarHeight` and `seriesColors` before their declarations had
+// been reached and drew into an image whose size really was zero (measured
+// 2026-09-21). `--run` must be first because it must NOT touch them; this must
+// be last because it must.
+if cliArgs.first == "--glyph" { renderGlyph(Array(cliArgs.dropFirst())) }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
