@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""Render agy's status line and cache only its documented quota fields.
+
+agy 1.2.7 pipes a state JSON object to this command whenever its state
+changes. The collector cannot query that state itself, so the status line is
+the supported bridge from a live agy session to Usage Meter.
+"""
+
+import datetime
+import json
+import math
+import os
+import pathlib
+import sys
+import tempfile
+import time
+
+
+def quota_rows(payload):
+    rows = []
+    quota = payload.get("quota")
+    if not isinstance(quota, dict):
+        return rows
+    for name, value in quota.items():
+        if not isinstance(name, str) or not isinstance(value, dict):
+            continue
+        remaining = value.get("remaining_fraction")
+        if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
+            continue
+        if not math.isfinite(remaining) or not 0 <= remaining <= 1:
+            continue
+        reset = value.get("reset_in_seconds")
+        if isinstance(reset, bool) or not isinstance(reset, (int, float)) or reset < 0:
+            reset = 0
+            iso = value.get("reset_time")
+            if isinstance(iso, str):
+                try:
+                    dt = datetime.datetime.fromisoformat(iso.replace("Z", "+00:00"))
+                    reset = max(0, int(dt.timestamp() - time.time()))
+                except ValueError:
+                    pass
+        rows.append({"name": name[:80], "used_percent": round((1 - remaining) * 100),
+                     "reset_in": int(reset)})
+    return rows
+
+
+def cache(rows, payload):
+    root = pathlib.Path(os.environ.get("USAGE_METER_CACHE_DIR") or
+                        pathlib.Path.home() / ".cache" / "usage-meter")
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(root, 0o700)
+    destination = root / "agy-quota.json"
+    data = {"ts": int(time.time()), "limits": rows,
+            "model": str((payload.get("model") or {}).get("display_name") or "")[:80],
+            "plan": str(payload.get("plan_tier") or "")[:40]}
+    fd, name = tempfile.mkstemp(prefix=".agy-quota-", dir=root)
+    try:
+        with os.fdopen(fd, "w") as out:
+            json.dump(data, out, separators=(",", ":"))
+            out.write("\n")
+        os.replace(name, destination)
+    finally:
+        if os.path.exists(name):
+            os.unlink(name)
+
+
+def main():
+    try:
+        payload = json.load(sys.stdin)
+        if not isinstance(payload, dict):
+            return
+        rows = quota_rows(payload)
+        if rows:
+            cache(rows, payload)
+        model = (payload.get("model") or {}).get("display_name") or "agy"
+        context = (payload.get("context_window") or {}).get("used_percentage")
+        parts = [str(model)[:28]]
+        if isinstance(context, (int, float)) and math.isfinite(context):
+            parts.append(f"ctx {context:.0f}%")
+        if rows:
+            parts.append(f"quota {max(row['used_percent'] for row in rows)}%")
+        print(" · ".join(parts))
+    except (OSError, ValueError, TypeError):
+        print("agy")
+
+
+if __name__ == "__main__":
+    main()
