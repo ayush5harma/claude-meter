@@ -20,12 +20,31 @@
 // thing making a number readable; a number goes warning-coloured only when a
 // limit is actually hot.
 //
-// ONE METER, EVERY AGENT. Claude Code owns the menu-bar glyph and the number
-// -- that is what this app is -- and any OTHER agentic CLI installed on this
-// Mac gets its own section in the dropdown, with the same gauges and the same
-// colours. A tool that is not installed contributes NOTHING: no section, no
-// empty row, no error. The collector simply does not name it, and this file
-// draws what it is given.
+// ONE METER, EVERY AGENT. The glyph shows Claude's three windows and then ONE
+// BAR PER OTHER TOOL the meter has a number for, so a Codex window at 96% is
+// visible without opening anything -- which is the whole point of a meter, and
+// was not true when Codex lived only in the dropdown. The number is still
+// Claude's session percentage until something is hot, and then the hottest
+// window of any tool takes it over and brings its own tag.
+//
+// Claude keeps three bars rather than collapsing to one, because on the
+// commonest Mac -- Claude alone -- one bar would throw away two limits that
+// are legible today to solve a problem that Mac does not have. The stack is
+// re-fitted to the menu bar's height instead of the item growing wider: the
+// item is 16 pt at three bars and 16 pt at five, so adding a tool never moves
+// anything else in the menu bar.
+//
+// ROTATING BETWEEN TOOLS WAS REJECTED and it was not close: a value that
+// changes while nothing changed is noise, and a meter that is sometimes
+// showing you the other tool is one you cannot read at a glance.
+//
+// In the dropdown every tool gets the SAME four parts in the same places --
+// name and identity, where the number came from and how old it is, one bar per
+// window, then the facts that are not percentages -- so the eye learns one
+// layout. A tool that is not installed contributes NOTHING: no section, no
+// empty row, no error. A tool that is installed but has no number to give
+// contributes one line rather than a section that could only ever say "no
+// data". The collector decides which; this file draws what it is given.
 //
 // IT COLLECTS NO DATA ITSELF. bin/claude-meter-stats emits the JSON.
 
@@ -113,7 +132,13 @@ struct Stats {
 // one, so a fixed set of names here would be wrong for somebody.
 struct ToolReading {
     var name = ""            // "Codex" — this app's word for the tool
+    var tag = ""             // the short form the menu bar has room for, "cdx"
     var ok = false
+    // A tool the collector says has no number to give: drawn as ONE LINE after
+    // the sections, never as a section. A section that can only ever say "no
+    // data" is a permanent empty chair; the fact worth carrying is that the
+    // meter knows the tool is there and knows why it has nothing.
+    var footnote = false
     var headline = ""        // account line beside the name, e.g. "you@example.com · free"
     var source = ""
     var ageS = -1
@@ -121,6 +146,18 @@ struct ToolReading {
     var retryIn = 0
     var note = ""            // why there is nothing to show, in words
     var limits: [(String, Limit)] = []
+    // Facts that are not a percentage — the model in use, credits, a ceiling
+    // the backend says has been reached — already worded by the collector and
+    // printed under the bars. The collector owns the words and this file owns
+    // the drawing, so a new fact is one line there and none here.
+    var details: [String] = []
+
+    // The one window that decides this tool's bar in the glyph and its claim on
+    // the number: hottest first, then highest, the same comparison the Claude
+    // limits are ranked by so one rule orders every window on the machine.
+    var worst: Limit? {
+        limits.map { $0.1 }.max { (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct) }
+    }
 }
 
 // Everything one collector run produced.
@@ -172,7 +209,12 @@ func muted(_ c: NSColor) -> NSColor {
 // series a bar belongs to, so three meters at similar low percentages are still
 // told apart at a glance (all-green bars were indistinguishable). Severity still
 // wins when a limit is actually hot — danger must never be traded for prettiness.
-let seriesColors: [NSColor] = [muted(.systemBlue), muted(.systemPurple), muted(.systemTeal)]
+// Five, not three: three named Claude's three windows, and the glyph now also
+// carries a bar per other tool while a multi-bucket Codex account can report
+// four windows in one section. Running out meant two different series wearing
+// one colour, which is the one thing per-series colour exists to prevent.
+let seriesColors: [NSColor] = [muted(.systemBlue), muted(.systemPurple), muted(.systemTeal),
+                               muted(.systemIndigo), muted(.systemGreen)]
 
 // One rule shared by every renderer, so the glyph, the number and the dropdown
 // can never disagree about "hot".
@@ -249,15 +291,34 @@ func drawGauge(_ rect: NSRect, pct: Int, color: NSColor) {
 // (yellow = data old, red = collector failing), deliberately separate from the
 // limit colours inside the bars so "the meter is sick" never masquerades as
 // "a limit is hot".
-func barsGlyph(_ limits: [Limit], badge: NSColor? = nil) -> NSImage {
-    let width: CGFloat = 16, barHeight: CGFloat = 2.6, gap: CGFloat = 2.2
-    let stackHeight = barHeight * 3 + gap * 2
+func barsGlyph(_ limits: [Limit], groupAfter: Int = 0, badge: NSColor? = nil) -> NSImage {
+    let width: CGFloat = 16
+    let count = max(1, limits.count)
+    // A wider gap after Claude's block, so five lines read as two groups rather
+    // than as a run of five.
+    let groupGap: CGFloat = (groupAfter > 0 && groupAfter < count) ? 1.6 : 0
+    // The item never gets wider; the stack gets denser. Three bars keep exactly
+    // the geometry this meter has always drawn (2.6 pt bars, 2.2 pt gaps, a
+    // 12.2 pt stack), four fit at full thickness because the menu bar is taller
+    // than that, and only at five does anything shrink -- and then by a tenth.
+    var barHeight: CGFloat = 2.6, gap: CGFloat = 2.2
+    let bars = barHeight * CGFloat(count) + gap * CGFloat(count - 1)
+    let maxStack = max(12.2, menuBarHeight - 4)
+    if bars + groupGap > maxStack {
+        let scale = (maxStack - groupGap) / bars
+        barHeight *= scale
+        gap *= scale
+    }
+    let stackHeight = barHeight * CGFloat(count) + gap * CGFloat(count - 1) + groupGap
     let image = NSImage(size: NSSize(width: width, height: menuBarHeight))
     image.lockFocus()
     NSGraphicsContext.current?.shouldAntialias = true
     let bottom = (menuBarHeight - stackHeight) / 2
     for (i, limit) in limits.enumerated() {
-        let y = bottom + CGFloat(limits.count - 1 - i) * (barHeight + gap)   // first limit on top
+        // First limit on top; everything above the group break is lifted by the
+        // extra gap.
+        let y = bottom + CGFloat(count - 1 - i) * (barHeight + gap)
+            + (i < groupAfter ? groupGap : 0)
         drawGauge(NSRect(x: 0, y: y, width: width, height: barHeight),
                   pct: limit.pct, color: gaugeColor(limit, i))
     }
@@ -289,8 +350,25 @@ final class UsageView: NSView {
     private static let rowHeight: CGFloat = 30
     private static let graphHeight: CGFloat = 60
     private let pad: CGFloat = 14
-    private let labelColumn: CGFloat = 60
     private let graphHeight: CGFloat = UsageView.graphHeight
+
+    // The label column is as wide as this section's own widest label, and that
+    // is not polish. It was 60 pt for everyone, which fits "Session", "Week"
+    // and a model name — and a multi-bucket codex account labels its rows by
+    // the metered bucket they belong to, so "Agents 30-day" and "Codex Weekly"
+    // were drawn straight THROUGH the gauge beside them (seen in the running
+    // app against the multi-bucket fixture, 2026-09-21; the JSON was correct
+    // and the menu was not, which is the whole argument for looking at it).
+    // Clamped at both ends: 60 keeps the tight layout every section had before
+    // this, and 120 stops one long label from leaving no room for the bar.
+    private static let labelFont = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+    private var labelColumn: CGFloat {
+        let widest = limits.reduce(CGFloat(0)) {
+            max($0, NSAttributedString(string: $1.0, attributes: [.font: UsageView.labelFont])
+                .size().width)
+        }
+        return min(120, max(60, widest.rounded(.up) + 10))
+    }
 
     // The exact height this view needs, so a section is sized from its own
     // content instead of from a constant that has to be re-guessed every time a
@@ -317,13 +395,15 @@ final class UsageView: NSView {
     private func drawLimitRows(top: CGFloat) -> CGFloat {
         let rowHeight = UsageView.rowHeight, barHeight: CGFloat = 12
         let percentColumn: CGFloat = 104
-        let gaugeWidth = bounds.width - pad * 2 - labelColumn - percentColumn
+        let gaugeWidth = bounds.width - pad * 2 - self.labelColumn - percentColumn
         var y = top
+        let labelColumn = self.labelColumn
         for (i, item) in limits.enumerated() {
             let (name, limit) = item
             y -= rowHeight
             let middle = y + rowHeight / 2
-            drawText(name, .secondaryLabelColor, x: pad, centredOn: middle, size: 12, weight: .medium)
+            drawText(name, .secondaryLabelColor, x: pad, centredOn: middle, size: 12, weight: .medium,
+                     maxWidth: labelColumn - 6)
             drawGauge(NSRect(x: pad + labelColumn, y: middle - barHeight / 2,
                              width: gaugeWidth, height: barHeight),
                       pct: limit.pct, color: gaugeColor(limit, i))
@@ -396,13 +476,29 @@ final class UsageView: NSView {
     // vertically centred on its row.
     private func drawText(_ s: String, _ color: NSColor, x: CGFloat, centredOn y: CGFloat,
                           size: CGFloat = 11, weight: NSFont.Weight = .regular,
-                          rightAligned: Bool = false) {
-        let text = NSAttributedString(string: s, attributes: [
+                          rightAligned: Bool = false, maxWidth: CGFloat? = nil) {
+        var attributes: [NSAttributedString.Key: Any] = [
             .font: NSFont.monospacedDigitSystemFont(ofSize: size, weight: weight),
             .foregroundColor: color,
-        ])
-        text.draw(at: NSPoint(x: rightAligned ? x - text.size().width : x,
-                              y: y - text.size().height / 2))
+        ]
+        // With a width given, the string is CLIPPED to it with an ellipsis
+        // rather than allowed to run on: a label the collector supplies is as
+        // long as the server's own words for a metered bucket, and a menu that
+        // paints one over the gauge beside it is worse than one that shortens
+        // it. Without a width, the old behaviour exactly.
+        if maxWidth != nil {
+            let paragraph = NSMutableParagraphStyle()
+            paragraph.lineBreakMode = .byTruncatingTail
+            attributes[.paragraphStyle] = paragraph
+        }
+        let text = NSAttributedString(string: s, attributes: attributes)
+        let size = text.size()
+        guard let maxWidth else {
+            text.draw(at: NSPoint(x: rightAligned ? x - size.width : x, y: y - size.height / 2))
+            return
+        }
+        text.draw(in: NSRect(x: rightAligned ? x - maxWidth : x, y: y - size.height / 2,
+                             width: maxWidth, height: size.height))
     }
 
     // The graph's small grey captions: the axis ticks and the span label, each
@@ -445,6 +541,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         candidates.append("/usr/local/bin/claude-meter-stats")
         candidates.append("/opt/homebrew/bin/claude-meter-stats")
         return candidates
+    }
+
+    // The tools that contribute a bar to the glyph and can claim the number:
+    // installed, not a footnote, and actually holding a reading. A tool that is
+    // installed but signed out still gets its section — it just has nothing to
+    // put in the menu bar.
+    private var numericTools: [ToolReading] { tools.filter { !$0.footnote && $0.ok } }
+
+    // The bars the glyph draws, and where Claude's block ends.
+    private var glyphBars: (limits: [Limit], groupAfter: Int) {
+        var bars = [stats.session, stats.weekly, stats.scoped]
+        let claudeBars = bars.count
+        for tool in numericTools {
+            if let worst = tool.worst { bars.append(worst) }
+        }
+        return (bars, bars.count > claudeBars ? claudeBars : 0)
     }
 
     // The meter's own health, distinct from the data's age. Three missed
@@ -574,7 +686,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // does not emit produces no section at all — presence gating lives in the
     // collector, and this table only decides the human-readable name and the
     // order. Adding a tool the collector learns to report is one row here.
-    private static let toolNames: [(key: String, name: String)] = [("codex", "Codex")]
+    private static let toolNames: [(key: String, name: String)] = [
+        ("codex", "Codex"), ("agy", "Antigravity"),
+    ]
 
     private static func parse(_ data: Data) -> Snapshot? {
         guard let root = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else { return nil }
@@ -605,7 +719,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let t = raw as? [String: Any] else { return nil }
         var tool = ToolReading()
         tool.name = name
+        tool.tag = (t["tag"] as? String ?? "").isEmpty
+            ? String(name.prefix(3)).lowercased() : (t["tag"] as? String ?? "")
         tool.ok = t["ok"] as? Bool ?? false
+        tool.footnote = t["footnote"] as? Bool ?? false
         tool.source = t["source"] as? String ?? ""
         tool.ageS = t["age_s"] as? Int ?? -1
         tool.fetchErr = t["fetch_err"] as? String ?? ""
@@ -622,6 +739,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // A section claiming ok with no window is the same lie as a reading with
         // no age: show the note instead of an empty gauge block.
+        tool.details = (t["details"] as? [String] ?? []).compactMap {
+            let line = $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            return line.isEmpty ? nil : line
+        }
         if tool.limits.isEmpty { tool.ok = false }
         return tool
     }
@@ -646,7 +767,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.attributedTitle = barText("—", .secondaryLabelColor)
             return
         }
-        button.image = barsGlyph([stats.session, stats.weekly, stats.scoped], badge: badge)
+        let glyph = glyphBars
+        button.image = barsGlyph(glyph.limits, groupAfter: glyph.groupAfter, badge: badge)
         let (text, color) = statusTitle()
         button.attributedTitle = barText(text, color)
     }
@@ -663,8 +785,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // scoped limit brings the name the endpoint gave it, truncated because the
     // menu bar is not elastic and a model name is not bounded.
     private func statusTitle() -> (String, NSColor) {
-        let named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly),
+        // Every window on the machine, ranked by one rule. A tool's claim is
+        // its own worst window, and it brings the tool's tag rather than the
+        // window's name: in the menu bar, which tool is hot is the thing you
+        // need, and the dropdown has the rest.
+        var named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly),
                                         (String(stats.scopedLabel.prefix(12)), stats.scoped)]
+        for tool in numericTools {
+            if let worst = tool.worst { named.append((tool.tag, worst)) }
+        }
         let worst = named.enumerated().max {
             (alertLevel($0.element.1), $0.element.1.pct) < (alertLevel($1.element.1), $1.element.1.pct)
         }!
@@ -691,8 +820,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func rebuildMenu(_ menu: NSMenu) {
         menu.removeAllItems()
-        addHeader(menu, stats.email.isEmpty ? "Claude usage"
-                                            : "\(stats.email) · \(stats.account)")
+        // The tool's NAME appears only when there is more than one section: a
+        // name that tells sections apart is not needed when there is one, so a
+        // Mac with only Claude reads exactly as it always has.
+        let named = !tools.filter { !$0.footnote }.isEmpty
+        let identity = stats.email.isEmpty ? "" : "\(stats.email) · \(stats.account)"
+        addHeader(menu, [named ? "Claude" : "", identity.isEmpty ? "Claude usage" : identity]
+            .filter { !$0.isEmpty }.joined(separator: " · "))
         if haveStats, stats.ok {
             addFreshnessRows(menu)
             let usage = UsageView(frame: NSRect(x: 0, y: 0, width: 340,
@@ -717,7 +851,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // drawn for a tool it did not name, so this loop runs zero times on a Mac
     // that has only Claude Code and the menu is unchanged.
     private func addToolSections(_ menu: NSMenu) {
-        for tool in tools {
+        for tool in tools where !tool.footnote {
             menu.addItem(.separator())
             addHeader(menu, tool.headline.isEmpty ? "\(tool.name) usage"
                                                   : "\(tool.name) · \(tool.headline)")
@@ -742,6 +876,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             usage.limits = tool.limits
             usage.drawsHistory = false
             let item = NSMenuItem(); item.view = usage; menu.addItem(item)
+            // Under the bars, not above: the percentages are what the section
+            // is for, and the model it is spending on is context for them.
+            for detail in tool.details { addNote(menu, detail) }
+        }
+        // Then the tools that have no number to give, one dim line each, after
+        // every section rather than inside one — the fact belongs to the
+        // machine, not to whichever tool happens to be drawn above it.
+        let footnotes = tools.filter { $0.footnote && !$0.note.isEmpty }
+        if !footnotes.isEmpty {
+            menu.addItem(.separator())
+            for tool in footnotes { addNote(menu, tool.note, color: .tertiaryLabelColor) }
         }
     }
 

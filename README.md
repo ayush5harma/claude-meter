@@ -8,9 +8,11 @@ Claude Code's `/usage` command calls, and every reading carries its age, so a
 stale one looks stale rather than passing for current.
 
 If another agentic CLI is installed on the same Mac and can report its own
-quota locally, the dropdown gets a section for it too, under Claude's. Today
-that is [Codex](#other-agentic-clis). A tool you do not have contributes
-nothing at all — no section, no empty row, no error.
+quota locally, it gets a bar in the menu-bar glyph and a section in the
+dropdown, under Claude's — today that is [Codex](#codex--supported). One that
+is installed but exposes no number gets a single line saying so, which today is
+[Antigravity](#antigravity-agy--installed-but-unreadable). A tool you do not
+have contributes nothing at all — no bar, no section, no empty row, no error.
 
 ## Install
 
@@ -63,44 +65,81 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** a 16 px glyph of three stacked mini-bars — session on top,
-week in the middle, the per-model weekly cap at the bottom — and one number
-beside it.
+**In the menu bar:** a 16 px glyph of stacked mini-bars and one number beside
+it. The stack is **Claude's three windows — session, week, the per-model weekly
+cap — and then one bar for every other tool the meter has a number for**, set
+off by a slightly wider gap. Claude alone is three bars; Claude and Codex, four.
 
 - The number is the **session** percentage, the one that moves while you work.
-- If another limit goes hot, that one takes the number over and brings its own
-  label, so the number is always self-describing: `wk 92%`, or the model name
-  the usage endpoint gave the third limit, `Fable 78%`.
-- A bar is blue, purple or teal by series, so three limits sitting at similar
-  low percentages can still be told apart. At 75% or a `warning` severity it
-  turns orange; at 90% or `critical`, red.
+- If any window goes hot — Claude's or another tool's — that one takes the
+  number over and brings its own label, so the number is always
+  self-describing: `wk 92%`, the model name the usage endpoint gave the third
+  limit (`Fable 78%`), or a tool's tag when the hot window is not Claude's
+  (`cdx 96%`).
+- A bar is blue, purple, teal, indigo or green by series, so windows sitting at
+  similar low percentages can still be told apart. At 75% or a `warning`
+  severity it turns orange; at 90% or `critical`, red.
+- The item never gets **wider** as tools are added: at five bars the stack
+  tightens by a tenth rather than the item growing, so nothing else in the menu
+  bar moves.
 - A **dot at the top-right of the glyph** is the meter's own health, never a
   limit: yellow means the data being shown is more than 45 minutes old (or that
   nothing has been collected yet), red means the collector itself is failing —
   three polls in a row, or 150 seconds, without a usable answer. A greyed-out
   number says the same as either dot.
 
-**In the dropdown:** the account email and which identity it belongs to; one
-line saying where the numbers came from and how old they are; a full-width gauge
-per limit with its exact percentage and time to reset; and a graph of how the
-three limits have moved over the recorded history, auto-scaled to the peak with
-the top tick labelled (on a fixed 0-100 axis these limits flatline along the
-bottom most of the time — honest, and useless). The percentages are the ones
-last collected, with their age worked out as you look; opening the menu also
-starts a collection, so the bar, and the next look, are fresh. `Refresh Now`
-(⌘R) collects immediately. `Quit Claude Meter` (⌘Q) exits the app, but the launchd agent keeps
-it alive and starts it again a moment later; to stop it for longer, unload the
-agent (`launchctl bootout gui/$(id -u)/com.ayushsharma.claude-meter`) or
-uninstall.
+**In the dropdown:** one section per installed tool, in a fixed order, each
+with the same four parts in the same places, so the eye learns one layout:
 
-Under the graph, one section per other agentic CLI that is installed — its
-name, the account it is signed into, where its numbers came from and how old
-they are, and a gauge per usage window. Those sections draw rows only: no
-history is recorded for them, and an empty plot under each one would be a
-promise the meter is not keeping.
+1. **Name · identity · plan** — `Claude · you@example.com · personal`,
+   `Codex · you@example.com · pro`. The name appears only when there is more
+   than one section: with one tool there is nothing to tell apart, so a Mac
+   with only Claude reads exactly as it always has.
+2. **Where the number came from and how old it is** — `Usage API · fetched 8s
+   ago`, `codex app-server · read 2m ago`. If the live fetch is down it says so
+   in words, with the reason and the retry time, instead of quietly showing an
+   old cache.
+3. **One full-width gauge per window**, with its exact percentage and time to
+   reset. Claude's section also carries a graph of how its three limits have
+   moved over the recorded history, auto-scaled to the peak with the top tick
+   labelled (on a fixed 0-100 axis these limits flatline along the bottom most
+   of the time — honest, and useless). Other tools have no recorded history, so
+   they draw rows only rather than an empty plot that promises one.
+4. **Facts that are not percentages** — the model in use, the models available,
+   credits, a ceiling the backend says has been reached.
 
-If the live fetch is down, the dropdown says so in words, with the reason and
-the retry time, instead of quietly showing an old cache.
+A tool that is installed but **signed out** gets its section with the sign-in
+hint in place of the bars. A tool that is installed but has **no number to
+give** gets one dim line after the last section rather than a section that
+could only ever say "no data" — today that is Antigravity, and
+[the reason is below](#antigravity-agy--installed-but-unreadable). A tool that
+is not installed contributes nothing at all.
+
+The percentages are the ones last collected, with their age worked out as you
+look; opening the menu also starts a collection, so the bar, and the next look,
+are fresh. `Refresh Now` (⌘R) collects immediately. `Quit Claude Meter` (⌘Q)
+exits the app, but the launchd agent keeps it alive and starts it again a
+moment later; to stop it for longer, unload the agent (`launchctl bootout
+gui/$(id -u)/com.ayushsharma.claude-meter`) or uninstall.
+
+### Why the glyph is shaped that way
+
+With more than one tool installed, a meter that shows only Claude is not a
+meter: a Codex window at 96% would be invisible until somebody opened the menu.
+Two other shapes were considered for the 16 px item and both lost.
+
+- **One bar for the tightest window across every tool, with a letter saying
+  whose.** On the commonest Mac — Claude alone — it throws away two of the
+  three limits that are legible there today, to solve a problem that Mac does
+  not have; and it puts a glyph, a letter and a number in 16 px, which is three
+  things competing for one glance.
+- **One bar per tool, uniformly.** The same objection in a weaker form: with
+  one tool installed it is a single bar where three fit. What ships *is* this,
+  for every tool except the one the app is named for — the only tool whose
+  per-window detail the item already has room for.
+- **Rotating between tools** was rejected outright. A value that changes while
+  nothing changed is noise, and a meter that is sometimes showing you the other
+  tool is one you cannot read at a glance.
 
 One Mac can hold more than one Claude Code identity — a personal account and a
 work account, say. The meter reads all of them and shows the one you are
@@ -328,6 +367,9 @@ It reads one key per other tool — today only `codex` — and, inside it:
 | `age_s` | int | Seconds since the reading was taken. The app adds the time since collection, as it does for Claude. |
 | `fetch_err`, `retry_in` | string, int | Why the live read is down and when it is tried again. Absent when it is up. |
 | `limits` | array | One object per usage window, in the tool's own order: `label` (string, what the window is), `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity`. An `ok` section with an empty `limits` is treated as not ok. |
+| `details` | array of strings | Facts that are not percentages, already worded by the collector, printed under the bars. The collector owns the words and the app owns the drawing, so a new fact is one line there and none here. |
+| `tag` | string | The short form the menu bar has room for when this tool's window is the hottest on the machine and takes the number over (`cdx`). Defaults to the first three letters of the name. |
+| `footnote` | bool | True for a tool that is installed but has no number to give. It is drawn as ONE line after the sections, contributes no bar to the glyph and never claims the number. `note` carries what the line says. |
 
 Which tools the app knows how to name, and in what order, is one table in
 `main.swift` (`toolNames`). A key not in it is ignored; a tool in it whose key
@@ -337,7 +379,9 @@ the collector does not emit draws nothing.
 dirs, each optionally `label=path`, replacing discovery), `CLAUDE_CONFIG_DIR`
 (Claude Code's own, added to the defaults), `CLAUDE_METER_CACHE_DIR`,
 `USAGE_API_TTL`, `CODEX_HOME` (Codex's own), `CODEX_USAGE_TTL`,
-`CLAUDE_METER_CODEX` (`0` to drop the Codex section).
+`CLAUDE_METER_CODEX` (`0` to drop the Codex section),
+`CLAUDE_METER_CODEX_MODELS` (`0` to drop just its model rows), `GEMINI_HOME`
+(where `agy` keeps its state) and `CLAUDE_METER_AGY` (`0` to drop its line).
 
 The app locates the collector at: `$CLAUDE_METER_STATS`, then
 `~/.local/bin/claude-meter-stats`, then `/usr/local/bin/claude-meter-stats`,
@@ -394,11 +438,28 @@ the question Codex's own UI asks.
   by the app-server, in its own process, exactly as Codex already uses them.
   Calling `chatgpt.com/backend-api/codex/usage` with a token read out of that
   file would have been a shorter path and the wrong one.
-- **Shown as** one row per usage window Codex reports (`primary`, then
-  `secondary` when there is one), each with the percentage used, the time to
-  reset, and a label derived from the window's own length — `5h`, `Weekly`,
-  `30-day`. The names are not hardcoded, because they are not stable: a free
-  plan reports a 43200-minute window where a paid plan reports a 300-minute one.
+- **Shown as** one row per usage window Codex reports — **every** window, in
+  every metered bucket. The response carries the same windows twice: its own
+  schema calls `rateLimits` the "backward-compatible single-bucket view" and
+  `rateLimitsByLimitId` the "multi-bucket view keyed by metered `limit_id`", so
+  the multi-bucket view wins when it has anything in it and each bucket
+  contributes its `primary` and its `secondary`. A bucket's name prefixes its
+  rows only when there is more than one bucket. Each row carries the percentage
+  used, the time to reset, and a label derived from the window's own length —
+  `5h`, `Weekly`, `30-day`, or the exact duration when it is none of those. The
+  names are not hardcoded, because they are not stable: this account's free
+  plan reports a single 43200-minute window where a paid plan reports a rolling
+  5-hour one with a weekly one beside it.
+- **The model** in use and the models the account can pick, from `model/list`
+  in the same spawn. Which model is in use is `config.toml`'s top-level `model`
+  key when it sets one, and the catalog entry the server marks `isDefault` when
+  it does not. Hidden models are left out — Codex hides them from its own
+  picker, so listing them would offer something the tool will not.
+- **Credits, and any ceiling the backend states outright** — `Credits:
+  unlimited`, `Credits: 1,250`, `Rate limit reached`, `Spend control reached` —
+  as plain sentences under the bars, and only when they say something. "Credits:
+  none" under every window of a plan that has no credits is a row that never
+  changes and never helps.
 - **Severity** comes from the same percentage thresholds the Claude limits use
   (75% warning, 90% critical), because Codex sends none — except for the two
   states its backend states outright, `rateLimitReachedType` and
@@ -406,45 +467,120 @@ the question Codex's own UI asks.
   says.
 - **Cached** in `~/.cache/claude-meter/codex-usage.json` (0600; it holds the
   account email), refreshed at most once per TTL — 120 s while a `codex` process
-  is alive, 900 s when idle — with a 180 s backoff after a failure. `CODEX_HOME`
-  and `CODEX_USAGE_TTL` are honoured; `CLAUDE_METER_CODEX=0` turns the section
-  off entirely.
+  is alive, 900 s when idle — with a 180 s backoff after a failure. The cache
+  carries a **version**, and an older one is not a cache: an upgraded collector
+  refetches once rather than serving a reading with its new rows missing for up
+  to a TTL. `CODEX_HOME` and `CODEX_USAGE_TTL` are honoured;
+  `CLAUDE_METER_CODEX=0` turns the section off entirely and
+  `CLAUDE_METER_CODEX_MODELS=0` drops just the model rows.
+- **Not shown, deliberately:** `account/usage/read` exists and answers, with
+  lifetime and per-day **token** totals. Token counts with no ceiling to divide
+  by are exactly what the Claude side of this meter replaced with percentages,
+  and showing them under another tool's name would put the one thing this meter
+  refuses to show back on the screen.
+- **`config/read` is never called**, and that is a security decision rather
+  than a taste one: it returns the whole effective config, `mcp_servers` and
+  their headers included, and those headers can carry an API token. The one
+  value needed is taken by parsing **only** the top-level keys of `config.toml`,
+  stopping dead at the first `[table]` header, so the parse cannot reach a
+  credential even in principle.
+
+#### What the plans get — OpenAI's published limits
+
+The menu shows measured numbers. This table is documentation, read from
+OpenAI's own pages on **2026-09-21**, for deciding whether a plan change is
+worth it. **Read it for its shape, not its precision:** OpenAI publishes these
+as ranges and estimates rather than as hard numbers, and says so.
+
+| Plan | Short window | Weekly window | Other |
+|---|---|---|---|
+| Free | Not published as a number — "explore Codex capabilities on quick coding tasks" [2] | Not published | No Free row exists in OpenAI's own comparison table. No image generation in Codex. |
+| Go | Not published as a number [2] | Not published | "Lightweight coding tasks." |
+| Plus | Published as a **range per model, per 5-hour period** — e.g. GPT-5.6 Terra 25–200 local messages, Luna 250–2,000, Sol 10–100. Explicitly "estimates", "not fixed message limits" [2] | "Weekly limits may also apply" — stated, never numbered [2] | Cloud chats may consume more of the allowance than local messages. |
+| Pro (5×) | The same rows at 5× Plus — Terra 125–1,000 per 5 h [2][3] | Same wording, no number | "5x or 20x higher Codex usage than Plus" [3]. |
+| Pro (20×) | The same rows at 20× Plus — Terra 500–4,000 per 5 h [2][3] | Same wording, no number | **New sign-ups and upgrades to the 20× tier were paused as of 2026-09-10**; existing subscriptions renew [3]. |
+| Business | Pro-5× column [2] | No number | One allowance pooled across Codex, ChatGPT Work, Excel, PowerPoint, Word and Workspace Agents; a credits rate card takes over once included limits are spent [4]. |
+| Enterprise / Edu | "Same per-seat usage limits as Plus for most features" [2] | As Plus | On flexible/credit pricing there are **no fixed rate limits** — usage scales with credits [2][4]. |
+
+**What upgrading actually changes.** Free is not in OpenAI's comparison table at
+all — it is not published as a smaller multiple of Plus, it is simply absent, so
+there is no documented number to compare a free account against. From Plus
+upward the change is a multiplier on the same 5-hour estimate table, not a new
+kind of window: Pro is the Plus rows at 5× or 20× [2][3]. Model access is the
+same roster across Plus and Pro.
+
+**Credits.** Plus and Pro users who hit a limit can buy additional credits
+rather than upgrading; Business/Edu/Enterprise workspaces buy workspace credits.
+A typical Codex task on GPT-5.6 Sol is quoted at 5–30 credits [4]. The
+`hasCredits` / `unlimited` / `balance` fields this meter reads are the CLI's own
+API shape and are not documented as product terms anywhere on OpenAI's pages.
+
+**The 30-day window is undocumented.** This account reports
+`windowDurationMins: 43200` on the free plan, and no OpenAI page names,
+explains or attributes that window. The meter shows it because the server sends
+it; what it means is not something OpenAI has published.
+
+**These numbers move.** All three help-centre articles carried "updated N days
+ago" stamps two to four days before they were read, and the pricing page itself
+notes GPT-5.5 retiring on 2026-10-14 and promotional GPT-5.6 Sol pricing
+running to 2026-11-21. Re-read before relying on any figure here.
+
+1. help.openai.com/en/articles/11369540, "Using Codex with your ChatGPT plan" — read 2026-09-21, page stamped ≈2026-09-17.
+2. developers.openai.com/codex/pricing — read 2026-09-21, no visible stamp, content current to Nov 2026.
+3. help.openai.com/en/articles/9793128, "About ChatGPT Pro tiers" — read 2026-09-21, stamped ≈2026-09-19.
+4. help.openai.com/en/articles/20001106, "ChatGPT Rate Card" — read 2026-09-21, stamped ≈2026-09-18.
 
 Nothing about Codex reaches the menu-bar glyph or the number beside it. Those
 are Claude Code's three limits, and a fourth or fifth bar would break the one
 thing the glyph says.
 
-#### Antigravity (`agy`) — not supported, and why
+#### Antigravity (`agy`) — installed but unreadable
 
 Google's [Antigravity CLI](https://antigravity.google/docs/cli) has quota — the
-TUI's `/usage`, `/quota` and `/credits` panels show it — but **there is no way
-to read it locally**, so the meter does not pretend to. Measured against agy
-1.2.7 on macOS, 2026-09-20:
+TUI's `/usage`, `/quota` and `/credits` panels show it — and **nothing outside
+the process can read it**. An installed `agy` therefore gets one dim line after
+the last section, saying exactly that, and no bar in the menu bar: a section
+that could only ever say "no data" is a permanent empty chair, where the fact
+worth carrying is that the meter knows `agy` is there and knows why it has
+nothing.
 
-- No subcommand reports it. The whole 1.2.7 set is `agent`/`agents`,
+Probed twice against agy 1.2.7 on macOS — signed **out** on 2026-09-20 and
+signed **in** on 2026-09-21, because the first result could have been an
+artefact of having no account:
+
+- **No subcommand reports it.** The whole 1.2.7 set is `agent`/`agents`,
   `changelog`, `help`, `install`, `mcp`, `mic-serve`, `models`,
   `plugin`/`plugins`, `remote-control`, `update`. The quota panels are slash
-  commands *inside* a session, not commands you can run.
-- Nothing persists it. An unauthenticated run writes state, logs, a
-  conversation-summary database and an MCP config under `~/.gemini/`, and no
-  file among them holds a quota number. The quota types
-  (`RetrieveUserQuotaSummary`, `FetchQuotaStatus`, `QuotaSummaryBucket`) are
-  gRPC messages that feed the TUI panels and are not written to disk.
-- Its statusline cannot carry it either. `agy` does have a `/statusline`
-  mechanism, but it is output-only: it runs a shell command and renders that
-  command's stdout. Unlike Claude Code's, it pipes no JSON payload *in*, so
-  there is no quota field for a script to pick up.
-- Without a sign-in nothing is even computed — the CLI's own log says
-  `doRefreshQuota: skipped (not logged in)`, so the gRPC call is never attempted.
+  commands *inside* a session, not commands you can run. `agy models` lists
+  models and efforts with no plan or quota field.
+- **Signed in, the refresh runs and logs no result.** `doRefreshQuota` fires
+  four or five times a session and only ever logs `starting reload (force=true)`
+  or `skipped (throttled)`. There is no completion line: a grep across both log
+  files for `QuotaSummary`, `remaining_fraction` and `FetchQuotaStatus` matched
+  **zero** times. The refresh calls `v1internal:loadCodeAssist` and the response
+  is never written to disk in any form.
+- **Nothing persists it.** `jetski_state.pbtxt` holds onboarding state and no
+  quota key; `cache/`, `implicit/`, `brain/`, `knowledge/` and the conversation
+  database hold nothing quota-shaped; no file under `~/.gemini` is named for
+  quota, usage or credits. The quota types (`RetrieveUserQuotaSummary`,
+  `FetchQuotaStatus`, `QuotaSummaryBucket`) are gRPC messages feeding the TUI.
+- **Its statusline cannot carry it.** `agy` has a `/statusline` mechanism, but
+  it is output-only: it runs a shell command and renders that command's stdout.
+  Unlike Claude Code's, it pipes no JSON payload *in*, so there is no quota
+  field for a script to pick up.
+- **There is a local server, and it answers one thing.** A live `agy` listens on
+  loopback, and the only endpoint that responds is `/healthz`, with a liveness
+  object. There is no documented equivalent of Codex's
+  `account/rateLimits/read`, and guessing at undocumented routes against a
+  signed-in session is not something a menu-bar meter gets to do.
 
 **What would unblock it:** a persisted snapshot, the way Claude Code writes
-`cachedUsageUtilization` and Codex answers `account/rateLimits/read` — either a
-local file `agy` writes after a quota refresh, a non-interactive subcommand that
-prints it, or a statusline payload that includes it. Any of the three, and the
-section is the same shape as the Codex one: a `codex_section()` twin in the
-collector and one row in the app's `toolNames` table. Until then, an installed
-`agy` adds nothing to the menu, which is the honest answer rather than a row
-that says "unknown" forever.
+`cachedUsageUtilization` and Codex answers `account/rateLimits/read` — a local
+file `agy` writes after a quota refresh, a completion line in its own log with
+the number in it, a non-interactive subcommand that prints it, a documented
+quota endpoint beside `/healthz`, or a statusline payload that includes it. Any
+one of them, and the footnote flag comes off and `agy` becomes a section like
+Codex's: the collector and the app already draw one from the same data.
 
 ### Bundle identifier and launchd label
 
@@ -578,12 +714,30 @@ The dates in the code comments are what each rule came from. The short version:
   where a paid plan reports 300 minutes. A hardcoded `5h` / `weekly` pair would
   have been wrong for one of them, so the label is derived from
   `windowDurationMins`.
-- **2026-09-20, Antigravity has no local number at all.** No subcommand prints
-  it, no file under `~/.gemini` holds it, the statusline mechanism carries no
-  payload into the script it runs, and without a sign-in the CLI's own log says
-  `doRefreshQuota: skipped (not logged in)` — the refresh is never even
-  attempted. Recorded as a blocker rather than engineered around; see
-  [Other agentic CLIs](#other-agentic-clis).
+- **2026-09-20 and 2026-09-21, Antigravity has no local number, signed out or
+  in.** The signed-out probe could have been an artefact of having no account,
+  so it was run again with one. Signed in, `doRefreshQuota` runs and logs no
+  result — a grep for `QuotaSummary`, `remaining_fraction` and
+  `FetchQuotaStatus` across both log files matched zero times — nothing under
+  `~/.gemini` persists a number, and the local HTTP server a live `agy` runs
+  answers `/healthz` and nothing else. Recorded as a blocker rather than
+  engineered around; see
+  [Antigravity](#antigravity-agy--installed-but-unreadable).
+- **2026-09-21, the window label column was too narrow, and only the running
+  app said so.** The multi-bucket fixture's JSON was correct and the menu was
+  not: labels like "Agents 30-day" were drawn straight through the gauge beside
+  them, because the label column had been a constant 60 pt since it only ever
+  held "Session" and "Week". It is now as wide as the section's own widest
+  label, clamped between 60 and 120 pt, with truncation past that.
+- **2026-09-21, an upgraded collector served its old cache.** The first run of
+  the new collector showed correct numbers and no model rows, for up to a full
+  TTL, with nothing on screen to say why — the cache predated the fields. The
+  cache now carries a version and an older one is simply not a cache.
+- **2026-09-21, Codex's three free methods.** `account/rateLimits/read` (0.79 s,
+  the windows), `account/read` (0.03 s, no network, the plan and email) and
+  `model/list` (the account's models and which is the catalog default) all
+  answer without a model request. `account/usage/read` answers too, with token
+  totals, and is deliberately not used.
 
 ### Provenance
 

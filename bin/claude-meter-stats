@@ -57,6 +57,10 @@
 #                             existence of auth.json -- never for its contents.
 #   CLAUDE_METER_CODEX        "0" turns the codex section off entirely
 #   CODEX_USAGE_TTL           seconds; overrides the adaptive 120s/900s TTL
+#   CLAUDE_METER_CODEX_MODELS "0" drops the model rows, keeping the windows
+#   GEMINI_HOME               where agy keeps its state (default ~/.gemini);
+#                             read for PRESENCE only, never for its contents
+#   CLAUDE_METER_AGY          "0" drops the agy line entirely
 
 set -uo pipefail
 
@@ -533,11 +537,27 @@ def append_history(label, limits):
 # catalogue.
 #
 # WHAT IS READ INSTEAD. codex ships its own local JSON-RPC server -- `codex
-# app-server`, stdio, the same one its desktop app drives -- and two of its
+# app-server`, stdio, the same one its desktop app drives -- and three of its
 # methods are exactly this: `account/read` (plan and email, answered from
-# $CODEX_HOME alone, 0.03 s, no network) and `account/rateLimits/read` (the
-# usage read, 0.79 s including its round trip).
-# Neither is a model request, so neither spends any of the account's quota.
+# $CODEX_HOME alone, 0.03 s, no network), `account/rateLimits/read` (the usage
+# read, 0.79 s including its round trip) and `model/list` (the models this
+# ACCOUNT may pick, and which is the catalog default). None of the three is a
+# model request, so none spends any of the account's quota.
+#
+# `account/usage/read` is deliberately NOT asked for, though it exists and
+# answers: it returns lifetime and per-day TOKEN totals (measured 2026-09-21:
+# lifetimeTokens, peakDailyTokens, a dailyUsageBuckets array). Token counts
+# with no ceiling to divide by are exactly what the Claude side of this file
+# replaced with percentages, and showing them here would put the one thing this
+# meter refuses to show back on the screen under another tool's name.
+#
+# `config/read` is NOT asked for either, and that is a security decision rather
+# than a taste one: it returns the whole effective config, `mcp_servers` and
+# their headers included, and on this fleet those headers carry a GitHub token.
+# The one config value needed -- which model a bare `codex` would run -- is
+# taken by parsing ONLY the top-level keys of config.toml, stopping dead at the
+# first `[table]` header, so the parse cannot reach a credential even in
+# principle. See codex_configured_model.
 #
 # THE CREDENTIAL STAYS CODEX'S. $CODEX_HOME/auth.json holds the account's
 # OAuth tokens and NOTHING here opens it: presence is `auth.json` existing, and
@@ -548,6 +568,13 @@ def append_history(label, limits):
 
 CODEX_HOME = pathlib.Path(os.environ.get("CODEX_HOME") or (HOME / ".codex"))
 CODEX_CACHE = CACHE_DIR / "codex-usage.json"
+# Bumped whenever a reading gains a field the app draws. A cache written by an
+# older collector is then simply not a cache, and the next poll refetches once
+# instead of serving a reading with the new rows missing for up to a TTL --
+# which is exactly what an upgraded collector did on this Mac before the gate
+# existed: correct numbers, no model rows, for fifteen minutes, and nothing on
+# screen to say why (measured 2026-09-21).
+CODEX_CACHE_VERSION = 2
 CODEX_BACKOFF = CACHE_DIR / "codex-usage.backoff"
 
 # Where a `codex` binary may be, after PATH. A launchd-spawned shell inherits a
@@ -728,10 +755,11 @@ def codex_window_label(minutes):
     return "%dm" % minutes
 
 
-def codex_limits(rate_limits):
-    """The windows to draw, in the order codex reports them. `usedPercent` is a
-    percentage of the ceiling that actually stops you, the same denominator the
-    Claude side uses, so the two sections mean the same thing by "78%".
+def codex_snapshot_limits(rate_limits, prefix=""):
+    """Every window in ONE rate-limit snapshot, in the order codex reports it.
+    `usedPercent` is a percentage of the ceiling that actually stops you, the
+    same denominator the Claude side uses, so the two sections mean the same
+    thing by "78%".
 
     codex sends no severity, so the app's own percentage thresholds decide --
     except for the two states the backend states outright, which are worth more
@@ -747,8 +775,9 @@ def codex_limits(rate_limits):
         if used is None:
             continue          # a window with no percentage is not a window
         resets_at = codex_int(window.get("resetsAt"))
+        label = codex_window_label(codex_int(window.get("windowDurationMins")))
         limits.append({
-            "label": codex_window_label(codex_int(window.get("windowDurationMins"))),
+            "label": (prefix + " " + label).strip(),
             "pct": used,
             # An epoch-seconds instant here, where the Claude side gets an ISO
             # string; both become seconds-from-now, and a lapsed one becomes 0
@@ -757,6 +786,138 @@ def codex_limits(rate_limits):
             "severity": "critical" if reached else "normal",
         })
     return limits
+
+
+def codex_limits(usage):
+    """EVERY window the account has, across every bucket the server reports.
+
+    The response carries the same windows twice. `rateLimits` is, in its own
+    schema's words, the "backward-compatible single-bucket view; mirrors the
+    historical payload"; `rateLimitsByLimitId` is the "multi-bucket view keyed
+    by metered limit_id (for example, `codex`)". Reading both would draw the
+    same bar twice, so the multi-bucket view wins when it has anything in it.
+
+    THIS IS THE PART THE FREE PLAN CANNOT PROVE. The account this was built
+    against reports ONE bucket with ONE window -- 43200 minutes, 30 days, 0%
+    used (measured 2026-09-21) -- and a paid plan reports a rolling 5-hour
+    window with a weekly one beside it, which is the shape OpenAI's own pricing
+    page describes. So nothing here may assume one window, one bucket, or any
+    particular duration; the fixtures under test/codex-fixtures drive the
+    multi-bucket, multi-window case through this same code because no request
+    to this account can produce one."""
+    buckets = usage.get("rateLimitsByLimitId")
+    if isinstance(buckets, dict) and buckets:
+        limits = []
+        # A bucket's id is a prefix only when there is more than one of them:
+        # with a single bucket (every account seen so far) it is the noise word
+        # "codex" in front of every row in a section already titled Codex.
+        named = len(buckets) > 1
+        for limit_id in sorted(buckets):
+            snapshot = buckets[limit_id]
+            if isinstance(snapshot, dict):
+                limits += codex_snapshot_limits(
+                    snapshot, (snapshot.get("limitName") or limit_id) if named else "")
+        if limits:
+            return limits
+    single = usage.get("rateLimits")
+    return codex_snapshot_limits(single) if isinstance(single, dict) else []
+
+
+# What the backend calls the state it is in, said in words a menu row can
+# carry. The keys are the RateLimitReachedType enum from the app-server's own
+# schema; an unknown one is printed as itself rather than swallowed, because a
+# state this script has not heard of is still a state worth seeing.
+RATE_LIMIT_REACHED_TEXT = {
+    "rate_limit_reached": "Rate limit reached",
+    "workspace_owner_credits_depleted": "Workspace credits depleted (owner)",
+    "workspace_member_credits_depleted": "Workspace credits depleted",
+    "workspace_owner_usage_limit_reached": "Workspace usage limit reached (owner)",
+    "workspace_member_usage_limit_reached": "Workspace usage limit reached",
+}
+
+
+def codex_state_notes(usage):
+    """The facts beside the bars: credits, and whether a ceiling has been hit.
+
+    Said only when they SAY something. "Credits: none" under every window on
+    every poll of a plan that has no credits is a row that never changes and
+    never helps, and this meter's whole argument is that a number on screen
+    should be one somebody would act on."""
+    notes = []
+    snapshot = usage.get("rateLimits")
+    snapshot = snapshot if isinstance(snapshot, dict) else {}
+    reached = snapshot.get("rateLimitReachedType")
+    if isinstance(reached, str) and reached:
+        notes.append(RATE_LIMIT_REACHED_TEXT.get(reached, reached.replace("_", " ").capitalize()))
+    if snapshot.get("spendControlReached") is True:
+        notes.append("Spend control reached")
+    credits = snapshot.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited") is True:
+            notes.append("Credits: unlimited")
+        elif credits.get("balance"):
+            notes.append("Credits: %s" % str(credits["balance"])[:24])
+        elif credits.get("hasCredits") is True:
+            notes.append("Credits available")
+    return notes
+
+
+def codex_configured_model(config_path):
+    """The model a bare `codex` would run, from config.toml's TOP-LEVEL `model`
+    key, or None when it sets none (which is the whole answer here: this fleet
+    deliberately pins no model, so the catalog default applies).
+
+    STOPS AT THE FIRST `[table]` HEADER, and that is the security property, not
+    an optimisation. codex keeps MCP server definitions in this file and on this
+    fleet one of them carries a GitHub token in an `http_headers` table; a parse
+    that walks the whole file could put that token one bug away from the blob
+    this script prints. A parse that cannot get past line one of the first table
+    cannot reach it however wrong the rest of this function is."""
+    try:
+        for raw in config_path.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("["):
+                return None                      # the tables begin; stop reading
+            if line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            if key.strip() != "model":
+                continue
+            value = value.strip().split("#")[0].strip()
+            return value.strip("\"'") or None
+    except Exception:
+        pass
+    return None
+
+
+def codex_models(models_result, configured):
+    """(what the effective model is called, every model this account may pick).
+
+    The server names its own catalog default with `isDefault`, so nothing here
+    hardcodes a model id that the next release retires -- the three this account
+    sees today are gpt-5.6-terra, gpt-5.6-luna and gpt-5.5 (measured
+    2026-09-21), and that list is the SERVER's answer for this account, not a
+    constant. Hidden models are left out: they are hidden from codex's own
+    picker, so a meter that listed them would be offering something the tool
+    will not."""
+    if not isinstance(models_result, dict):
+        return (configured or ""), []
+    available, default_label, configured_label = [], "", ""
+    for model in (models_result.get("data") or []):
+        if not isinstance(model, dict) or model.get("hidden") is True:
+            continue
+        label = (model.get("displayName") or model.get("id") or "").strip()
+        if not label:
+            continue
+        available.append(label)
+        if model.get("isDefault") is True:
+            default_label = label
+        if configured and configured in (model.get("id"), model.get("model")):
+            configured_label = label
+    # A configured model the catalog does not list is still what codex would
+    # run, so it is reported as its raw id rather than silently replaced by the
+    # default -- the meter must not tell you you are on a model you are not.
+    return (configured_label or configured or default_label), available
 
 
 def codex_backoff_state():
@@ -771,14 +932,17 @@ def codex_backoff_state():
 
 
 def codex_fetch(binary):
-    """(reading, errkind). One app-server run answers both questions."""
-    answers = codex_app_server(binary, {
+    """(reading, errkind). One app-server run answers all three questions."""
+    calls = {
         1: ("account/read", {}),
         # excludeResetCreditDetails skips a second backend lookup the app-server
         # would otherwise make; its own schema calls that the shape for
         # "background usage polls", which is exactly what this is.
         2: ("account/rateLimits/read", {"excludeResetCreditDetails": True}),
-    })
+    }
+    if os.environ.get("CLAUDE_METER_CODEX_MODELS", "1") != "0":
+        calls[3] = ("model/list", {})
+    answers = codex_app_server(binary, calls)
     if answers is None:
         return None, "spawn"
     usage = answers.get(2)
@@ -794,9 +958,14 @@ def codex_fetch(binary):
     account = (account.get("account") if isinstance(account, dict) else None) or {}
     if not isinstance(account, dict):
         account = {}
+    # The model half is optional in both directions: a model/list that failed
+    # must cost the section its model rows, never its numbers.
+    model, available = codex_models(answers.get(3),
+                                    codex_configured_model(CODEX_HOME / "config.toml"))
     return {"email": account.get("email") or "",
             "plan": rate_limits.get("planType") or account.get("planType") or "",
-            "rate_limits": rate_limits}, None
+            "model": model, "models": available,
+            "usage": usage}, None
 
 
 def codex_section():
@@ -815,7 +984,8 @@ def codex_section():
 
     cached = load_json(CODEX_CACHE)
     reading, fetched_at = None, 0.0
-    if isinstance(cached, dict) and isinstance(cached.get("data"), dict):
+    if isinstance(cached, dict) and isinstance(cached.get("data"), dict) \
+            and cached.get("v") == CODEX_CACHE_VERSION:
         reading, fetched_at = cached["data"], float(cached.get("fetched_at") or 0)
     in_backoff, fail_why, retry_in = codex_backoff_state()
     # Which TTL applies depends on whether codex is running, and asking that
@@ -838,7 +1008,8 @@ def codex_section():
             try:
                 CACHE_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
                 # 0600: the account's email, nobody else's business.
-                write_private(CODEX_CACHE, json.dumps({"fetched_at": NOW, "data": fresh}))
+                write_private(CODEX_CACHE, json.dumps(
+                    {"v": CODEX_CACHE_VERSION, "fetched_at": NOW, "data": fresh}))
                 if CODEX_BACKOFF.exists():
                     CODEX_BACKOFF.unlink()
             except Exception:
@@ -860,7 +1031,13 @@ def codex_section():
         # a number. The section still exists, so the reason is visible.
         out.setdefault("note", "No usage read yet")
         return out
-    limits = codex_limits(reading.get("rate_limits") or {})
+    # The whole usage answer, kept as the server sent it: the shape is read at
+    # RENDER time, so a new window or bucket the server starts sending is drawn
+    # by the next poll rather than by the next release. A cache too old to have
+    # it cannot get here -- CODEX_CACHE_VERSION rejected it above.
+    usage = reading.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    limits = codex_limits(usage)
     if not limits:
         out["note"] = "codex reported no usage window"
         return out
@@ -869,7 +1046,23 @@ def codex_section():
     out["email"] = reading.get("email") or ""
     out["plan"] = reading.get("plan") or ""
     out["source"] = "codex app-server"
+    # The short form the menu bar has room for when a codex window is the
+    # hottest thing on the machine and takes the number over.
+    out["tag"] = "cdx"
     out["age_s"] = max(0, int(NOW - fetched_at))
+    # Plain sentences the app prints under the bars. The COLLECTOR owns the
+    # wording and the app owns the drawing, so a new fact -- another backend
+    # state, another credit shape -- is one line here and no change there.
+    details = codex_state_notes(usage)
+    model = reading.get("model") or ""
+    available = [m for m in (reading.get("models") or []) if isinstance(m, str)]
+    if model:
+        details.append("Model: %s" % model[:40])
+    others = [m for m in available if m != model]
+    if others:
+        details.append("Also available: %s" % ", ".join(others)[:60])
+    if details:
+        out["details"] = details
     return out
 
 
@@ -911,6 +1104,60 @@ def claude_section():
     return out
 
 
+# ── agy (Google's Antigravity CLI) ──────────────────────────────────────────
+#
+# agy HAS a quota -- its TUI shows `/usage`, `/quota` and `/credits` panels --
+# and NOTHING can read it from outside the process. Probed twice, signed out on
+# 2026-09-20 and signed IN on 2026-09-21, against agy 1.2.7:
+#
+#   - No subcommand prints it. The whole set is agent(s), changelog, help,
+#     install, mcp, mic-serve, models, plugin(s), remote-control, update; the
+#     quota panels are slash commands inside a session, not commands.
+#   - Nothing persists it. Signed in, `doRefreshQuota` fires four or five times
+#     a session and logs only "starting reload" and "skipped (throttled)" --
+#     there is no completion line, and a grep for QuotaSummary,
+#     remaining_fraction and FetchQuotaStatus across both log files matched
+#     zero times. `jetski_state.pbtxt` carries onboarding state and no quota
+#     key; nothing under cache/, implicit/, brain/, knowledge/ or the
+#     conversation database holds a number; no file under ~/.gemini is named
+#     for quota, usage or credits.
+#   - Its statusline cannot carry it: agy runs a shell command and renders that
+#     command's stdout, and pipes no payload IN, so there is no field to read.
+#   - It DOES run a local HTTP server (a live agy listens on loopback), but the
+#     only endpoint that answers is /healthz, with a liveness object. There is
+#     no documented equivalent of codex's `account/rateLimits/read`, and
+#     guessing at undocumented routes on the owner's own signed-in session is
+#     not something a menu-bar meter gets to do.
+#
+# So agy contributes ONE LINE, not a section: a section that can only ever say
+# "no data" is a permanent empty chair, where the fact actually worth carrying
+# is that the meter knows agy is installed and knows why it has nothing. The
+# `footnote` flag is general -- the day agy persists a number, it is deleted
+# and agy becomes a section like codex.
+
+AGY_HOME = pathlib.Path(os.environ.get("GEMINI_HOME") or (HOME / ".gemini"))
+
+
+def agy_section():
+    """The `agy` key of the blob, or None when this Mac has no agy."""
+    if os.environ.get("CLAUDE_METER_AGY", "1") == "0":
+        return None
+    binary = shutil.which("agy")
+    if not binary:
+        for directory in CODEX_BIN_DIRS:      # the same search, for the same reason
+            candidate = pathlib.Path(os.path.expanduser(directory)) / "agy"
+            if os.access(str(candidate), os.X_OK) and candidate.is_file():
+                binary = str(candidate)
+                break
+    # `~/.gemini` alone is NOT the signal: the gemini CLI is a different tool
+    # that lives there too, and a bare `gemini --version` creates it. The
+    # subdirectory agy writes on its first run is what says agy has run here.
+    if not binary or not (AGY_HOME / "antigravity-cli").is_dir():
+        return None
+    return {"ok": False, "footnote": True,
+            "note": "Antigravity is installed · it exposes no usage locally"}
+
+
 def main():
     # `claude` is always emitted; every other tool contributes a key ONLY when
     # it is installed, so the blob a Mac with neither produces carries the same
@@ -919,7 +1166,7 @@ def main():
     # the Claude reading is what this app exists for and must survive a second
     # tool misbehaving.
     blob = {"claude": claude_section(), "ts": int(NOW)}
-    for key, build in (("codex", codex_section),):
+    for key, build in (("codex", codex_section), ("agy", agy_section)):
         try:
             section = build()
         except Exception:
