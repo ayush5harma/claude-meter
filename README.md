@@ -233,10 +233,14 @@ killed whatever happens, so a hung server cannot outlive the poll that made it.
 A cached poll costs no process at all: the whole collector ran in 0.105 s with
 both readings warm, against 1.59 s when both had to be fetched.
 
-The app runs the collector with a 25 s watchdog. The collector bounds its own
-slow path (`curl --max-time 15`, and Codex's 10 s), so the watchdog only trips
-when something is genuinely wedged, and it turns a silent freeze into a visible
-error state.
+The app runs the collector with a **40 s** watchdog — 25 s until Codex was read,
+which covered `curl --max-time 15` alone and would have killed a merely-slow run
+that also did the 10 s Codex read, reporting a timeout for something that was
+working. It is not a bound on every timeout the collector can impose (that sum
+exceeded 25 s before Codex existed too); it is the line past which a run is
+wedged rather than slow, and crossing it turns a silent freeze into a visible
+error state. 40 s still sits well under the 150 s without a good collection that
+marks the meter sick.
 
 ### Files
 

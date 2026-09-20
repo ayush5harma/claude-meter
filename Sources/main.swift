@@ -547,12 +547,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } catch {
             return (nil, "collector failed to start")
         }
-        // Watchdog. The script bounds its own slow path (curl 15s), so 25s only
-        // trips when something is genuinely wedged; killing it turns a silent
-        // freeze into a visible error state. The read below still returns
-        // because every child holding the pipe is itself time-bounded.
+        // Watchdog. The collector's slow paths are its own: the Claude usage
+        // endpoint (curl 15s), and, when codex is installed, one bounded
+        // app-server read (10s) after it. 25s covered the first alone and would
+        // now kill a merely-slow run that did both, reporting a timeout for
+        // something that was working; 40s clears the realistic sum and still
+        // sits well under the 150s with no good collection that marks the meter
+        // sick. It is not a bound on the theoretical worst case -- adding up
+        // every timeout the collector can impose exceeds it, as it exceeded 25s
+        // before codex was ever read -- because those are the wedged cases this
+        // exists to turn into a visible error state rather than a silent freeze.
+        // The read below still returns because every child holding the pipe is
+        // itself time-bounded.
         let killer = DispatchWorkItem { if collector.isRunning { collector.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + 25, execute: killer)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 40, execute: killer)
         let output = pipe.fileHandleForReading.readDataToEndOfFile()
         collector.waitUntilExit()
         killer.cancel()
