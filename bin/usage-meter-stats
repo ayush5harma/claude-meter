@@ -1192,34 +1192,13 @@ def claude_section():
 
 # ── agy (Google's Antigravity CLI) ──────────────────────────────────────────
 #
-# agy HAS a quota -- its TUI shows `/usage`, `/quota` and `/credits` panels --
-# and NOTHING can read it from outside the process. Probed twice, signed out on
-# 2026-09-20 and signed IN on 2026-09-21, against agy 1.2.7:
-#
-#   - No subcommand prints it. The whole set is agent(s), changelog, help,
-#     install, mcp, mic-serve, models, plugin(s), remote-control, update; the
-#     quota panels are slash commands inside a session, not commands.
-#   - Nothing persists it. Signed in, `doRefreshQuota` fires four or five times
-#     a session and logs only "starting reload" and "skipped (throttled)" --
-#     there is no completion line, and a grep for QuotaSummary,
-#     remaining_fraction and FetchQuotaStatus across both log files matched
-#     zero times. `jetski_state.pbtxt` carries onboarding state and no quota
-#     key; nothing under cache/, implicit/, brain/, knowledge/ or the
-#     conversation database holds a number; no file under ~/.gemini is named
-#     for quota, usage or credits.
-#   - Its statusline cannot carry it: agy runs a shell command and renders that
-#     command's stdout, and pipes no payload IN, so there is no field to read.
-#   - It DOES run a local HTTP server (a live agy listens on loopback), but the
-#     only endpoint that answers is /healthz, with a liveness object. There is
-#     no documented equivalent of codex's `account/rateLimits/read`, and
-#     guessing at undocumented routes on the owner's own signed-in session is
-#     not something a menu-bar meter gets to do.
-#
-# So agy contributes ONE LINE, not a section: a section that can only ever say
-# "no data" is a permanent empty chair, where the fact actually worth carrying
-# is that the meter knows agy is installed and knows why it has nothing. The
-# `footnote` flag is general -- the day agy persists a number, it is deleted
-# and agy becomes a section like codex.
+# agy has no headless quota subcommand and persists no quota file (measured
+# 2026-09-21, v1.2.7). Its documented status-line protocol does expose quota
+# on stdin, correcting the earlier conclusion drawn from local files alone.
+# The flake installs bin/agy-usage-statusline. agy pipes the
+# documented `quota` object to it on state changes; it keeps only percentages,
+# reset times, model and plan in a private cache. This gives the menu a real
+# agy section while a live TUI is open, without calling an undocumented API.
 
 AGY_HOME = pathlib.Path(os.environ.get("GEMINI_HOME") or (HOME / ".gemini"))
 
@@ -1240,8 +1219,32 @@ def agy_section():
     # subdirectory agy writes on its first run is what says agy has run here.
     if not binary or not (AGY_HOME / "antigravity-cli").is_dir():
         return None
-    return {"ok": False, "footnote": True,
-            "note": "Antigravity is installed · it exposes no usage locally"}
+    saved = load_json(CACHE_DIR / "agy-quota.json")
+    if not isinstance(saved, dict) or not isinstance(saved.get("limits"), list):
+        return {"ok": False, "note": "Open agy once to collect its quota"}
+    saved_at = saved.get("ts")
+    if isinstance(saved_at, bool) or not isinstance(saved_at, (int, float)) or saved_at <= 0:
+        return {"ok": False, "note": "agy quota cache has no timestamp"}
+    limits = []
+    for item in saved["limits"]:
+        if not isinstance(item, dict):
+            continue
+        used, reset = item.get("used_percent"), item.get("reset_in")
+        if not isinstance(used, int) or isinstance(used, bool) or not 0 <= used <= 100:
+            continue
+        if not isinstance(reset, int) or isinstance(reset, bool) or reset < 0:
+            reset = 0
+        limits.append({"label": str(item.get("name") or "Quota")[:80],
+                       "pct": used, "reset_in": max(0, reset - max(0, int(NOW - saved_at))),
+                       "severity": "critical" if used >= 90 else "warning" if used >= 75 else "normal"})
+    if not limits:
+        return {"ok": False, "note": "agy has not reported a quota yet"}
+    details = []
+    if saved.get("model"):
+        details.append("Model: %s" % str(saved["model"])[:80])
+    return {"ok": True, "limits": limits, "tag": "agy", "plan": str(saved.get("plan") or "")[:40],
+            "source": "agy status line", "age_s": max(0, int(NOW - saved_at)),
+            "details": details}
 
 
 def main():

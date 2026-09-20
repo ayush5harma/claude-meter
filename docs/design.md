@@ -7,8 +7,8 @@ the code can be checked against it.
 
 **How close am I to being stopped, by anything.** Not how much I have used —
 used is only meaningful against a ceiling — and not which tool is busiest.
-One number, one glyph, and the promise that if something is about to stop you
-it is *already on screen* before you click.
+One glyph and one compact number per installed agent. If any quota is close
+to its ceiling, its own label is already visible before you click.
 
 Everything else is the dropdown. The item is read in a saccade; the dropdown is
 read deliberately.
@@ -21,9 +21,9 @@ moves anything else in the menu bar; the stack gets denser instead. Measured on
 a 22 pt menu bar: three bars at 2.600 pt (unscaled), four at 2.508, five at
 1.956.
 
-The number is Claude's session percentage until some window is hot, and then
-the hottest window of any tool takes it over and brings its own short tag
-(`wk 92%`, `Fable 78%`, `cdx 96%`).
+The adjacent labels show each installed agent's tightest window: `Cl42 Cd16
+Ag61`. The glyph retains Claude's three windows and adds a bar for Codex and
+agy when they have data. A dash means no quota has been reported yet.
 
 Rejected: one bar for the tightest window across all tools (throws away two
 legible limits on the commonest Mac); one bar per tool uniformly (same, weaker);

@@ -7,12 +7,13 @@ will actually stop you. The numbers come from the same OAuth usage endpoint
 Claude Code's `/usage` command calls, and every reading carries its age, so a
 stale one looks stale rather than passing for current.
 
-If another agentic CLI is installed on the same Mac and can report its own
-quota locally, it gets a bar in the menu-bar glyph and a section in the
-dropdown, under Claude's — today that is [Codex](#codex--supported). One that
-is installed but exposes no number gets a single line saying so, which today is
-[Antigravity](#antigravity-agy--installed-but-unreadable). A tool you do not
-have contributes nothing at all — no bar, no section, no empty row, no error.
+The menu bar reports the tightest quota for each installed agent: Claude,
+Codex, and Antigravity (`agy`). The dropdown shows every reported window, its
+reset time, source, and freshness. Codex is read through its app server. agy
+sends its documented status-line payload to `agy-usage-statusline`, which keeps
+only quota percentages, reset times, model, and plan in a private cache. The
+flake installs that bridge and declares it in agy's settings; a standalone
+install needs the same `statusLine` setting added manually.
 
 ## Install
 
@@ -65,29 +66,13 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** a 16 px glyph of stacked mini-bars and one number beside
-it. The stack is **Claude's three windows — session, week, the per-model weekly
-cap — and then one bar for every other tool the meter has a number for**, set
-off by a slightly wider gap. Claude alone is three bars; Claude and Codex, four.
-
-- The number is the **session** percentage, the one that moves while you work.
-- If any window goes hot — Claude's or another tool's — that one takes the
-  number over and brings its own label, so the number is always
-  self-describing: `wk 92%`, the model name the usage endpoint gave the third
-  limit (`Fable 78%`), or a tool's tag when the hot window is not Claude's
-  (`cdx 96%`).
-- A bar is blue, purple, teal, indigo or green by series, so windows sitting at
-  similar low percentages can still be told apart. At 75% or a `warning`
-  severity it turns orange; at 90% or `critical`, red.
-- The item never gets **wider** as tools are added, so nothing else in the
-  menu bar moves; the stack gets denser instead. On a 22 pt menu bar, three
-  bars are the geometry this meter has always drawn, unscaled; a fourth costs
-  3.5% of the bar's thickness and a fifth costs a quarter of it.
-- A **dot at the top-right of the glyph** is the meter's own health, never a
-  limit: yellow means the data being shown is more than 45 minutes old (or that
-  nothing has been collected yet), red means the collector itself is failing —
-  three polls in a row, or 150 seconds, without a usable answer. A greyed-out
-  number says the same as either dot.
+**In the menu bar:** the 16 pt glyph stacks Claude's three windows, then
+one bar for Codex and one for agy when they report a number. The adjacent text
+shows each installed agent's tightest percentage (`Cl42 Cd16 Ag61`); a dash
+means that agent has not reported a quota yet. This makes every agent visible
+before a warning threshold is crossed. Orange means at least 75% used; red
+means at least 90%. A dot on the glyph marks stale data (yellow) or repeated
+collector failures (red). Click for individual windows and reset times.
 
 **In the dropdown:** one section per installed tool, in a fixed order, each
 with the same four parts in the same places, so the eye learns one layout:
@@ -119,12 +104,8 @@ with the same four parts in the same places, so the eye learns one layout:
 4. **Facts that are not percentages** — the model in use, the models available,
    credits, a ceiling the backend says has been reached.
 
-A tool that is installed but **signed out** gets its section with the sign-in
-hint in place of the bars. A tool that is installed but has **no number to
-give** gets one dim line after the last section rather than a section that
-could only ever say "no data" — today that is Antigravity, and
-[the reason is below](#antigravity-agy--installed-but-unreadable). A tool that
-is not installed contributes nothing at all.
+A signed-out or unreported agent keeps a short explanation in its section.
+A tool that is not installed contributes no section.
 
 The percentages are the ones last collected, with their age worked out as you
 look; opening the menu also starts a collection, so the bar, and the next look,
@@ -568,53 +549,18 @@ Nothing about Codex reaches the menu-bar glyph or the number beside it. Those
 are Claude Code's three limits, and a fourth or fifth bar would break the one
 thing the glyph says.
 
-#### Antigravity (`agy`) — installed but unreadable
+#### Antigravity (`agy`) — status-line quota bridge
 
-Google's [Antigravity CLI](https://antigravity.google/docs/cli) has quota — the
-TUI's `/usage`, `/quota` and `/credits` panels show it — and **nothing outside
-the process can read it**. An installed `agy` therefore gets one dim line after
-the last section, saying exactly that, and no bar in the menu bar: a section
-that could only ever say "no data" is a permanent empty chair, where the fact
-worth carrying is that the meter knows `agy` is there and knows why it has
-nothing.
-
-Probed twice against agy 1.2.7 on macOS — signed **out** on 2026-09-20 and
-signed **in** on 2026-09-21, because the first result could have been an
-artefact of having no account:
-
-- **No subcommand reports it.** The whole 1.2.7 set is `agent`/`agents`,
-  `changelog`, `help`, `install`, `mcp`, `mic-serve`, `models`,
-  `plugin`/`plugins`, `remote-control`, `update`. The quota panels are slash
-  commands *inside* a session, not commands you can run. `agy models` lists
-  models and efforts with no plan or quota field.
-- **Signed in, the refresh runs and logs no result.** `doRefreshQuota` fires
-  four or five times a session and only ever logs `starting reload (force=true)`
-  or `skipped (throttled)`. There is no completion line: a grep across both log
-  files for `QuotaSummary`, `remaining_fraction` and `FetchQuotaStatus` matched
-  **zero** times. The refresh calls `v1internal:loadCodeAssist` and the response
-  is never written to disk in any form.
-- **Nothing persists it.** `jetski_state.pbtxt` holds onboarding state and no
-  quota key; `cache/`, `implicit/`, `brain/`, `knowledge/` and the conversation
-  database hold nothing quota-shaped; no file under `~/.gemini` is named for
-  quota, usage or credits. The quota types (`RetrieveUserQuotaSummary`,
-  `FetchQuotaStatus`, `QuotaSummaryBucket`) are gRPC messages feeding the TUI.
-- **Its statusline cannot carry it.** `agy` has a `/statusline` mechanism, but
-  it is output-only: it runs a shell command and renders that command's stdout.
-  Unlike Claude Code's, it pipes no JSON payload *in*, so there is no quota
-  field for a script to pick up.
-- **There is a local server, and it answers one thing.** A live `agy` listens on
-  loopback, and the only endpoint that responds is `/healthz`, with a liveness
-  object. There is no documented equivalent of Codex's
-  `account/rateLimits/read`, and guessing at undocumented routes against a
-  signed-in session is not something a menu-bar meter gets to do.
-
-**What would unblock it:** a persisted snapshot, the way Claude Code writes
-`cachedUsageUtilization` and Codex answers `account/rateLimits/read` — a local
-file `agy` writes after a quota refresh, a completion line in its own log with
-the number in it, a non-interactive subcommand that prints it, a documented
-quota endpoint beside `/healthz`, or a statusline payload that includes it. Any
-one of them, and the footnote flag comes off and `agy` becomes a section like
-Codex's: the collector and the app already draw one from the same data.
+Google's [status-line protocol](https://antigravity.google/docs/cli/statusline/)
+pipes a JSON state object to the configured command whenever agy's state
+changes. Its `quota` object contains model or bucket IDs, remaining fractions,
+and reset times. `bin/agy-usage-statusline` reads that input, renders a compact
+agy status line, and caches only the quota fields that Usage Meter needs under
+`~/.cache/usage-meter/agy-quota.json` with mode 0600. A running agy TUI must
+produce a status-line update before the first agy percentage appears; when agy
+is closed the last reading remains visibly aged. The flake configures the
+command on Caraxes. This replaces the 2026-09-21 conclusion based only on
+agy's lack of a quota file or headless subcommand.
 
 ### Renamed from Claude Meter, 2026-09-21
 

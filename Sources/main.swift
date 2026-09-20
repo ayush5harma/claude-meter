@@ -2,9 +2,8 @@
 // utilisation: the 5-hour session window, the weekly all-models window and the
 // weekly premium-model ("scoped") window, each against its real ceiling.
 //
-// GLANCEABLE, NOT A WALL. The bar shows ONE number — the session % beside a
-// three-bar glyph that encodes all three limits — because a menu-bar item is
-// read in a saccade, not studied. The detail (per-limit bars, resets, history
+// GLANCEABLE, NOT A WALL. The bar shows one compact percentage per installed
+// agent beside the stacked glyph. The detail (per-limit bars, resets, history
 // graph) lives in the dropdown, rebuilt fresh every time it opens.
 //
 // A STALE METER MUST LOOK STALE. The collector can fail (network down, the
@@ -23,9 +22,8 @@
 // ONE METER, EVERY AGENT. The glyph shows Claude's three windows and then ONE
 // BAR PER OTHER TOOL the meter has a number for, so a Codex window at 96% is
 // visible without opening anything -- which is the whole point of a meter, and
-// was not true when Codex lived only in the dropdown. The number is still
-// Claude's session percentage until something is hot, and then the hottest
-// window of any tool takes it over and brings its own tag.
+// was not true when Codex lived only in the dropdown. Cl, Cd and Ag beside
+// the glyph report each tool's tightest window even before one turns hot.
 //
 // Claude keeps three bars rather than collapsing to one, because on the
 // commonest Mac -- Claude alone -- one bar would throw away two limits that
@@ -773,7 +771,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     // The bars the glyph draws, and where Claude's block ends.
     private var glyphBars: (limits: [Limit], groupAfter: Int) {
-        var bars = [stats.session, stats.weekly, stats.scoped]
+        var bars = stats.ok ? [stats.session, stats.weekly, stats.scoped] : []
         let claudeBars = bars.count
         for tool in numericTools {
             if let worst = tool.worst { bars.append(worst) }
@@ -796,7 +794,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     // 45 min covers the collector's worst normal cadence (900s idle TTL plus a
     // failed attempt's backoff); older than that means refresh is broken.
-    private var dataStale: Bool { dataAge >= 45 * 60 }
+    private var dataStale: Bool {
+        (stats.ok && dataAge >= 45 * 60) || numericTools.contains { toolDataAge($0) >= 45 * 60 }
+    }
 
     func applicationDidFinishLaunching(_: Notification) {
         // SINGLE INSTANCE. A launchd agent owns this app, so any second copy —
@@ -989,7 +989,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func render() {
         guard let button = statusItem.button else { return }
         let badge = badgeColor()
-        guard haveStats, stats.ok else {
+        guard haveStats, stats.ok || !numericTools.isEmpty else {
             // Before the first collection lands there is nothing to be sick
             // about yet, but the dash still has to say it is not a reading.
             button.image = barsGlyph([Limit(), Limit(), Limit()],
@@ -1009,31 +1009,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         return dataStale ? muted(.systemYellow) : nil
     }
 
-    // The number beside the glyph is the SESSION % — the value that moves while
-    // working — unless another limit is hot, in which case the hot one takes
-    // over with its label so the number stays self-describing ("wk 92%"). The
-    // scoped limit brings the name the endpoint gave it, truncated because the
-    // menu bar is not elastic and a model name is not bounded.
+    // Show each installed agent's tightest window explicitly. The earlier
+    // single number showed Claude until another tool became hot, so a Codex
+    // or agy quota could change invisibly while still below the warning line.
+    // The dropdown keeps each tool's full window breakdown and reset times.
     private func statusTitle() -> (String, NSColor) {
-        // Every window on the machine, ranked by one rule. A tool's claim is
-        // its own worst window, and it brings the tool's tag rather than the
-        // window's name: in the menu bar, which tool is hot is the thing you
-        // need, and the dropdown has the rest.
-        var named: [(String, Limit)] = [("5h", stats.session), ("wk", stats.weekly),
-                                        (String(stats.scopedLabel.prefix(12)), stats.scoped)]
-        for tool in numericTools {
-            if let worst = tool.worst { named.append((tool.tag, worst)) }
+        let claudeLimits = [stats.session, stats.weekly, stats.scoped]
+        let claudeWorst = stats.ok ? claudeLimits.max {
+            (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct)
+        } : nil
+        var parts = ["Cl\(claudeWorst.map { String($0.pct) } ?? "—")"]
+        var worst = claudeWorst
+        for tool in tools {
+            let tag = tool.name == "Codex" ? "Cd" : "Ag"
+            let reading = tool.ok ? tool.worst : nil
+            parts.append("\(tag)\(reading.map { String($0.pct) } ?? "—")")
+            if let reading, worst == nil || (alertLevel(reading), reading.pct) >
+                (alertLevel(worst!), worst!.pct) { worst = reading }
         }
-        let worst = named.enumerated().max {
-            (alertLevel($0.element.1), $0.element.1.pct) < (alertLevel($1.element.1), $1.element.1.pct)
-        }!
-        guard alertLevel(worst.element.1) != .normal else {
-            let dimmed = dataStale || collectorSick
-            return ("\(stats.session.pct)%", dimmed ? .secondaryLabelColor : .labelColor)
-        }
-        let text = worst.offset == 0 ? "\(stats.session.pct)%"
-                                     : "\(worst.element.0) \(worst.element.1.pct)%"
-        return (text, gaugeColor(worst.element.1, worst.offset))
+        let color: NSColor = dataStale || collectorSick ? .secondaryLabelColor
+            : (worst.flatMap { alertLevel($0) == .normal ? nil : gaugeColor($0, 0) } ?? .labelColor)
+        return (parts.joined(separator: " "), color)
     }
 
     // MARK: Menu (rebuilt at open, so ages are computed when eyes are on them)
