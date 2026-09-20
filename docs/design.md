@@ -143,12 +143,26 @@ it becomes an ordinary section with no UI change at all.
 
 ## Appearance and accessibility
 
-- Every colour is a **dynamic** system colour or a blend of one, so light and
-  dark resolve per appearance rather than being hard-coded for the owner's dark
-  bar. The gauge track is `quaternaryLabelColor`, which inverts with the
-  appearance; the measured contrast for each drawn colour, in both appearances,
-  is in `docs/contrast.md`.
-- The type scale is fixed point sizes. AppKit menus do not follow the system
-  text-size setting for custom-drawn views, so the dropdown does **not** scale
-  with it — stated rather than implied. Deriving the scale from one constant is
-  what makes that answerable later.
+- Every colour is a **dynamic** system colour or a blend of one, resolved when
+  it is drawn rather than when this file's globals are initialised, so light and
+  dark each get their own value instead of both getting whichever appearance the
+  app launched into. The gauge track is `quaternaryLabelColor`, which inverts
+  with the appearance.
+- **The palette enforces its own contrast floor.** Muting and legibility pull in
+  opposite directions and legibility wins: `muted()` blends toward the neutral
+  that is away from the background and then keeps going until the result clears
+  WCAG's 3:1 for a graphical object against the track. Writing this note was
+  what prompted measuring it, and measuring it found the light appearance
+  failing everywhere — the health badge at 1.25:1. `docs/contrast.md` has the
+  table and `swift test/contrast/contrast.swift` fails the build's conscience if
+  it slips again.
+- **Increase contrast** drops the muting entirely. That setting is the user
+  saying they do not want de-emphasis, and muting is exactly that.
+- **The type scale is relative to `NSFont.systemFontSize`**, not absolute, so a
+  Mac with a larger system font gets a proportionally larger dropdown.
+- **It does not follow the Accessibility text size.** Measured 2026-09-21:
+  `NSFont.systemFont(ofSize:)` returns the size it is asked for whatever that
+  setting is; `NSFont.preferredFont(forTextStyle:)` is the API that follows it,
+  and adopting it means re-deriving every metric in the grid above from what it
+  returns. A known gap. Naming the scale in one place is what makes it a day's
+  work rather than an archaeology project.
