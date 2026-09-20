@@ -93,6 +93,60 @@ func runUnderThisIdentity(_ argv: [String]) -> Never {
     exit(child.terminationStatus)
 }
 
+// MARK: - CLI mode — render the glyph to a file
+//
+// `UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light|dark]`
+// draws the menu-bar glyph and exits. It exists because the images in the
+// README and docs/ have to be regenerated whenever the design moves, and
+// driving the real menu bar with AppleScript to photograph it is a worse way
+// to get them: it can only ever produce the appearance the machine is
+// currently in, so the LIGHT one could not be checked at all without changing
+// a setting on somebody's Mac.
+//
+// The bars are given explicitly rather than collected, so an image in the
+// documentation shows what it says it shows.
+//
+// Before any AppKit global, for the same reason as `--run`.
+func renderGlyph(_ argv: [String]) -> Never {
+    var out = "", bars = [27, 98, 76], appearanceName = "dark"
+    var rest = argv[...]
+    if let first = rest.first, !first.hasPrefix("--") { out = first; rest = rest.dropFirst() }
+    while let flag = rest.first {
+        rest = rest.dropFirst()
+        guard let value = rest.first else { break }
+        rest = rest.dropFirst()
+        switch flag {
+        case "--bars": bars = value.split(separator: ",").compactMap { Int($0) }
+        case "--appearance": appearanceName = value
+        case "--out": out = value
+        default: break
+        }
+    }
+    guard !out.isEmpty, !bars.isEmpty else {
+        FileHandle.standardError.write(Data(
+            "usage: UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light|dark]\n".utf8))
+        exit(64)
+    }
+    // AppKit needs its shared application before anything can be drawn into an
+    // image: without it `lockFocus` fails with "size zero" on an image whose
+    // size is plainly not zero (measured 2026-09-21). `.prohibited` keeps this
+    // out of the Dock and out of the status bar -- a render is not a launch.
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    NSAppearance.current = NSAppearance(named: appearanceName == "light" ? .aqua : .darkAqua)
+    let limits = bars.map { Limit(pct: $0) }
+    let image = barsGlyph(limits, groupAfter: limits.count > 3 ? 3 : 0)
+    guard let tiff = image.tiffRepresentation,
+          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+        FileHandle.standardError.write(Data("UsageMeter: could not encode the glyph\n".utf8))
+        exit(70)
+    }
+    do { try png.write(to: URL(fileURLWithPath: out)) } catch {
+        FileHandle.standardError.write(Data("UsageMeter: cannot write \(out): \(error)\n".utf8))
+        exit(73)
+    }
+    exit(0)
+}
+
 let cliArgs = Array(CommandLine.arguments.dropFirst())
 if cliArgs.first == "--run" { runUnderThisIdentity(Array(cliArgs.dropFirst())) }
 
@@ -213,12 +267,22 @@ func formatAge(_ seconds: Int) -> String {
 // itself. Monospaced digits everywhere a number is drawn: a percentage ticking
 // from 9% to 10% must not shift the column it sits in.
 enum Type {
-    static let identity: CGFloat = 12.5     // "Codex · you@example.com · pro"
-    static let figure: CGFloat = 13         // the percentage, the one number per row
-    static let label: CGFloat = 12          // the window's name
-    static let body: CGFloat = 11.5         // source and age, details, footnotes
-    static let caption: CGFloat = 11        // the countdown
-    static let tick: CGFloat = 8            // the graph's axis
+    // Relative to the system font size rather than absolute, so a Mac
+    // configured with a larger one gets a proportionally larger dropdown.
+    //
+    // Measured 2026-09-21: NSFont.systemFontSize is 13 by default here, and
+    // AppKit does NOT scale systemFont(ofSize:) with the Accessibility text
+    // size -- NSFont.preferredFont(forTextStyle:) is the API that does, and
+    // adopting it would mean re-deriving every metric below from what it
+    // returns. So this closes the half that is free, and the other half is a
+    // known gap rather than an unknown one.
+    static let scale = NSFont.systemFontSize / 13
+    static let identity: CGFloat = 12.5 * scale   // "Codex · you@example.com · pro"
+    static let figure: CGFloat = 13 * scale       // the percentage, one number per row
+    static let label: CGFloat = 12 * scale        // the window's name
+    static let body: CGFloat = 11.5 * scale       // source and age, details, footnotes
+    static let caption: CGFloat = 11 * scale      // the countdown
+    static let tick: CGFloat = 8 * scale          // the graph's axis
 }
 
 enum Metric {
@@ -280,6 +344,10 @@ let trackSurface: [Bool: CGFloat] = [true: 0.208, false: 0.859]
 //     going to pure black or white; nothing in the current palette hits it.
 func muted(_ c: NSColor) -> NSColor {
     NSColor(name: nil) { appearance in
+        // "Increase contrast" is the user saying, in the system's own words,
+        // that they do not want de-emphasis. Muting is exactly that, so it is
+        // dropped and the full-strength system colour is used instead.
+        if NSWorkspace.shared.accessibilityDisplayShouldIncreaseContrast { return c }
         let isDark = appearance.bestMatch(from: [.aqua, .darkAqua]) != .aqua
         let neutral = NSColor(calibratedWhite: isDark ? 0.58 : 0.34, alpha: 1)
         let away = NSColor(calibratedWhite: isDark ? 1 : 0, alpha: 1)
@@ -1118,6 +1186,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func doRefresh() { refresh() }
     @objc private func quit() { NSApp.terminate(nil) }
 }
+
+// AFTER every global, unlike `--run`, and the difference is the reason both
+// comments exist. This is main.swift, so globals are initialised in FILE ORDER
+// as top-level code runs, not lazily: dispatching a render from up beside
+// `--run` read `menuBarHeight` and `seriesColors` before their declarations had
+// been reached and drew into an image whose size really was zero (measured
+// 2026-09-21). `--run` must be first because it must NOT touch them; this must
+// be last because it must.
+if cliArgs.first == "--glyph" { renderGlyph(Array(cliArgs.dropFirst())) }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

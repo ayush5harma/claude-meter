@@ -93,19 +93,29 @@ off by a slightly wider gap. Claude alone is three bars; Claude and Codex, four.
 with the same four parts in the same places, so the eye learns one layout:
 
 1. **Name · identity · plan** — `Claude · you@example.com · personal`,
-   `Codex · you@example.com · pro`. The name appears only when there is more
-   than one section: with one tool there is nothing to tell apart, so a Mac
-   with only Claude reads exactly as it always has.
+   `Codex · you@example.com · pro`. Every section names its tool, Claude
+   included: this is a meter for several agents, and a section that is
+   unambiguous only by accident is not a design.
 2. **Where the number came from and how old it is** — `Usage API · fetched 8s
    ago`, `codex app-server · read 2m ago`. If the live fetch is down it says so
    in words, with the reason and the retry time, instead of quietly showing an
    old cache.
-3. **One full-width gauge per window**, with its exact percentage and time to
-   reset. Claude's section also carries a graph of how its three limits have
-   moved over the recorded history, auto-scaled to the peak with the top tick
+3. **One row per window** — label, gauge, percentage, countdown, in those
+   columns. The same anatomy in every tool's section: a Codex 5-hour window and
+   a Claude session window are the same row with different words in it.
+   Claude's section also carries a graph of how its three limits have moved
+   over the recorded history, auto-scaled to the peak with the top tick
    labelled (on a fixed 0-100 axis these limits flatline along the bottom most
    of the time — honest, and useless). Other tools have no recorded history, so
    they draw rows only rather than an empty plot that promises one.
+
+   **A plan with one window is composed differently**, because it is a
+   different thing and not a smaller version of the same thing. A free Codex
+   account has one number that will read 0% for most of a month and one fact
+   worth having — when it resets — so it gets a full-width bar with the
+   percentage beside the window's name above it and the countdown spelled out
+   underneath: `resets in 29d 23h`. Two or more windows use the column grid,
+   where comparing them is the point.
 4. **Facts that are not percentages** — the model in use, the models available,
    credits, a ceiling the backend says has been reached.
 
@@ -123,12 +133,24 @@ exits the app, but the launchd agent keeps it alive and starts it again a
 moment later; to stop it for longer, unload the agent (`launchctl bootout
 gui/$(id -u)/com.ayushsharma.usage-meter`) or uninstall.
 
+The full design — the grid, the type scale, what each colour means, how a
+single-window plan is composed differently from a multi-window one — is
+[docs/design.md](docs/design.md), written before the code so the code can be
+checked against it.
+
 ### Why the glyph is shaped that way
 
-| Claude alone | Claude + Codex | Codex hot | Five bars |
-|---|---|---|---|
-| ![three bars](docs/menu-bar/glyph-claude-only.png) | ![four bars](docs/menu-bar/glyph-claude-and-codex.png) | ![four bars, the last one red](docs/menu-bar/glyph-codex-hot.png) | ![five bars](docs/menu-bar/glyph-five-bars.png) |
-| Session, week, per-model cap — unchanged, 2.600 pt bars | a fourth bar, Codex's worst window, after a wider gap (here at 0%, so an empty track); 2.508 pt | the fourth bar red, and the number beside it reads `cdx 96%` | the geometry at five, from a fixture: 1.956 pt bars, and the item is still 16 pt wide |
+| | Claude alone | Claude + Codex | Codex hot | Five bars |
+|---|---|---|---|---|
+| dark | ![](docs/menu-bar/claude-only-dark.png) | ![](docs/menu-bar/claude-codex-dark.png) | ![](docs/menu-bar/codex-hot-dark.png) | ![](docs/menu-bar/five-bars-dark.png) |
+| light | ![](docs/menu-bar/claude-only-light.png) | ![](docs/menu-bar/claude-codex-light.png) | ![](docs/menu-bar/codex-hot-light.png) | ![](docs/menu-bar/five-bars-light.png) |
+| | session, week, per-model cap; 2.600 pt bars | a fourth bar, the other tool's worst window, after a wider gap; 2.508 pt | the fourth bar red, and the number beside it reads `cdx 96%` | 1.956 pt bars, and the item is still 16 pt wide |
+
+Both appearances, because a glyph that survives one and vanishes in the other
+is a defect and this one did: see [Contrast](docs/contrast.md). Rendered by the
+app itself — `UsageMeter --glyph <out.png> --bars 27,98,76,42 --appearance
+light` — rather than photographed off a menu bar, which can only ever show the
+appearance the machine is currently in.
 
 Captured from the running app at 2x and cropped to the glyph. The item is 16 pt
 wide in all four.
@@ -332,6 +354,7 @@ module, another launcher — depends on these three things and nothing else.
 |---|---|
 | `UsageMeter` | Runs the menu-bar app. Terminates any other running instance of the same bundle id first. |
 | `UsageMeter --run <program> [args…]` | Spawns the program as a child, waits, exits with its status. Never draws a menu-bar item. |
+| `UsageMeter --glyph <out.png> [--bars 27,98,76,42] [--appearance light\|dark]` | Renders the menu-bar glyph to a PNG and exits, so the images in this README can be regenerated in either appearance without photographing somebody's menu bar. |
 
 **Collector output** — `usage-meter-stats` prints one JSON object on stdout:
 
@@ -593,6 +616,39 @@ quota endpoint beside `/healthz`, or a statusline payload that includes it. Any
 one of them, and the footnote flag comes off and `agy` becomes a section like
 Codex's: the collector and the app already draw one from the same data.
 
+### Renamed from Claude Meter, 2026-09-21
+
+It meters three agents, so it is not the Claude meter. The app is
+`Usage Meter.app`, its bundle id `local.ayushsharma.usage-meter`, its
+executable `UsageMeter`, its collector `usage-meter-stats`, its agent
+`com.ayushsharma.usage-meter` and its cache `~/.cache/usage-meter`.
+
+**There is nothing to re-grant.** A bundle-id change loses every macOS privacy
+grant keyed to the old one, so that was checked before it was made: on
+2026-09-21, `select service, client, auth_value from access where client like
+'%claude-meter%'` against `/Library/Application Support/com.apple.TCC/TCC.db`
+returned **no rows**, out of 65 across 42 clients — and the same query returns
+three rows for Claude Code, so the table and the query were live rather than
+empty. This Mac has no per-user TCC database at all. The meter needed no
+privacy grant because it reads only its own cache and runs its own collector.
+
+**Every old name still works for one release**, because a config-management run
+pins a commit and hard-codes the paths it deploys and launches:
+
+- `bin/claude-meter-stats` execs `bin/usage-meter-stats`.
+- Every `USAGE_METER_*` variable falls back to its `CLAUDE_METER_*` spelling.
+- The app looks for the collector under both names, new first.
+- The build leaves `Claude Meter.app` as a symlink to the new bundle and
+  `Contents/MacOS/ClaudeMeter` as a symlink to `UsageMeter`, both made before
+  signing so the seal covers them.
+- `~/.cache/claude-meter` is renamed to `~/.cache/usage-meter` on the first
+  run, once, and never over an existing directory.
+
+An installed `Claude Meter.app` is **not** deleted by a build or an install —
+an installed application is yours. `bash install.sh --uninstall-legacy` retires
+it, and the symlinks above should be deleted from `build.sh` once whatever
+deploys this has moved to the new names.
+
 ### Bundle identifier and launchd label
 
 The bundle id is `local.ayushsharma.usage-meter` and the agent label is
@@ -632,6 +688,24 @@ job that needs the grant rather than widening this one.
 Ad-hoc signing also means the code directory hash changes on every rebuild, so
 macOS may ask you to approve a grant again after `build.sh`. That prompt is
 expected: it is the system noticing the binary is genuinely different.
+
+### Accessibility
+
+- **Contrast is enforced, not assumed.** Every drawn colour clears WCAG's 3:1
+  floor for a graphical object in *both* appearances; `swift
+  test/contrast/contrast.swift` prints the table and exits non-zero if anything
+  slips. The measurement found a real defect — see
+  [docs/contrast.md](docs/contrast.md).
+- **Increase contrast** turns the muting off. That setting is the user saying
+  they do not want de-emphasis, and muting is exactly that, so the full-strength
+  system colours are used instead.
+- **Type scales with the system font size**, because the scale is expressed
+  relative to `NSFont.systemFontSize` rather than in absolute points.
+- **It does not scale with the Accessibility text size.** Measured 2026-09-21:
+  AppKit's `systemFont(ofSize:)` returns the size it is asked for regardless of
+  that setting; `NSFont.preferredFont(forTextStyle:)` is the API that follows
+  it, and adopting it means re-deriving every metric in the grid from what it
+  returns. A known gap, stated rather than implied.
 
 ### Colour
 
