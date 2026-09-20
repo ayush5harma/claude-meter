@@ -1,0 +1,21 @@
+{
+ "account/read": "not-an-object",
+ "account/rateLimits/read": {
+  "rateLimits": {
+   "primary": {
+    "usedPercent": "abc",
+    "windowDurationMins": "300",
+    "resetsAt": "soon"
+   },
+   "secondary": [],
+   "planType": 7,
+   "credits": "some",
+   "spendControlReached": "yes",
+   "rateLimitReachedType": 42
+  },
+  "rateLimitsByLimitId": "not-a-map"
+ },
+ "model/list": {
+  "data": "not-a-list"
+ }
+}
