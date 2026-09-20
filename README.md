@@ -7,6 +7,11 @@ will actually stop you. The numbers come from the same OAuth usage endpoint
 Claude Code's `/usage` command calls, and every reading carries its age, so a
 stale one looks stale rather than passing for current.
 
+If another agentic CLI is installed on the same Mac and can report its own
+quota locally, the dropdown gets a section for it too, under Claude's. Today
+that is [Codex](#other-agentic-clis). A tool you do not have contributes
+nothing at all — no section, no empty row, no error.
+
 ## Install
 
 You need macOS, the Xcode Command Line Tools (`xcode-select --install`, for
@@ -88,6 +93,12 @@ it alive and starts it again a moment later; to stop it for longer, unload the
 agent (`launchctl bootout gui/$(id -u)/com.ayushsharma.claude-meter`) or
 uninstall.
 
+Under the graph, one section per other agentic CLI that is installed — its
+name, the account it is signed into, where its numbers came from and how old
+they are, and a gauge per usage window. Those sections draw rows only: no
+history is recorded for them, and an empty plot under each one would be a
+promise the meter is not keeping.
+
 If the live fetch is down, the dropdown says so in words, with the reason and
 the retry time, instead of quietly showing an old cache.
 
@@ -104,7 +115,9 @@ Two pieces, and a launchd agent that keeps the app running.
   account it belongs to, where the numbers came from and how old they are. It
   reads Claude Code's own config files, derives that identity's keychain item to
   get its OAuth token, and calls the usage endpoint at most once per TTL,
-  falling back to Claude Code's cached numbers when the live path is down.
+  falling back to Claude Code's cached numbers when the live path is down. It
+  adds a key per other agentic CLI it finds installed, and none for one it does
+  not.
 - **`Sources/main.swift`**, the app, runs the collector every 30 seconds (and at
   wake, and whenever the menu is opened), draws the glyph and the number, and
   rebuilds the dropdown every time it opens.
@@ -210,9 +223,20 @@ the network every time.
   the file is capped at 2000 rows — a few tens of KB. The graph draws the most
   recent 400 of them.
 
+Codex is asked on the same terms, through its own local server rather than over
+the network directly: at most once per TTL (120 s while a `codex` process is
+alive, 900 s idle, `CODEX_USAGE_TTL` overrides), a 180 s backoff after a
+failure, the answer cached in its own file, and the age of what is shown
+reported beside it. The app-server call is bounded at 10 s — measured at 0.79 s,
+so the bound is for something wedged rather than a budget — and the child is
+killed whatever happens, so a hung server cannot outlive the poll that made it.
+A cached poll costs no process at all: the whole collector ran in 0.105 s with
+both readings warm, against 1.59 s when both had to be fetched.
+
 The app runs the collector with a 25 s watchdog. The collector bounds its own
-slow path (`curl --max-time 15`), so the watchdog only trips when something is
-genuinely wedged, and it turns a silent freeze into a visible error state.
+slow path (`curl --max-time 15`, and Codex's 10 s), so the watchdog only trips
+when something is genuinely wedged, and it turns a silent freeze into a visible
+error state.
 
 ### Files
 
@@ -220,6 +244,8 @@ genuinely wedged, and it turns a silent freeze into a visible error state.
 ~/.cache/claude-meter/usage-api.json       the last good API answer
 ~/.cache/claude-meter/usage-api.backoff    when the network path may be tried again
 ~/.cache/claude-meter/usage-history.csv    the points the dropdown graphs
+~/.cache/claude-meter/codex-usage.json     the last good codex reading (only if codex is installed)
+~/.cache/claude-meter/codex-usage.backoff  when codex may be asked again
 ~/.cache/claude-meter/claude-meter.launchd.log   the agent's stderr
 ```
 
@@ -258,10 +284,12 @@ module, another launcher — depends on these three things and nothing else.
 **Collector output** — `claude-meter-stats` prints one JSON object on stdout:
 
 ```json
-{"claude": { ... }, "ts": 1789210900}
+{"claude": { ... }, "ts": 1789210900, "codex": { ... }}
 ```
 
-The app reads `root["claude"]` and, inside it:
+`claude` and `ts` are always present. Every other key is a tool that is
+installed on this Mac, and is **absent** — not empty, not `ok: false` — when the
+tool is not. The app reads `root["claude"]` and, inside it:
 
 | Field | Type | Meaning |
 |---|---|---|
@@ -285,10 +313,27 @@ the app falls back to `"Model"` too if the field is absent entirely — an older
 collector, say. The app truncates it to 12 characters in the menu bar, where
 width is not free, and prints it in full in the dropdown.
 
+It reads one key per other tool — today only `codex` — and, inside it:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ok` | bool | False when there is nothing honest to show. The section still appears (the tool *is* installed), with `note` saying why. |
+| `note` | string | Why there are no numbers, in words: "Not signed in — run `codex login`", "No usage read yet". |
+| `email`, `plan` | string | Joined with ` · ` into the section header beside the tool's name. |
+| `source` | string | Where the reading came from, printed as-is: `codex app-server`. |
+| `age_s` | int | Seconds since the reading was taken. The app adds the time since collection, as it does for Claude. |
+| `fetch_err`, `retry_in` | string, int | Why the live read is down and when it is tried again. Absent when it is up. |
+| `limits` | array | One object per usage window, in the tool's own order: `label` (string, what the window is), `pct` (int), `reset_in` (seconds, 0 = unknown or lapsed), `severity`. An `ok` section with an empty `limits` is treated as not ok. |
+
+Which tools the app knows how to name, and in what order, is one table in
+`main.swift` (`toolNames`). A key not in it is ignored; a tool in it whose key
+the collector does not emit draws nothing.
+
 **Collector environment** — `CLAUDE_METER_CONFIG_DIRS` (colon-separated config
 dirs, each optionally `label=path`, replacing discovery), `CLAUDE_CONFIG_DIR`
 (Claude Code's own, added to the defaults), `CLAUDE_METER_CACHE_DIR`,
-`USAGE_API_TTL`.
+`USAGE_API_TTL`, `CODEX_HOME` (Codex's own), `CODEX_USAGE_TTL`,
+`CLAUDE_METER_CODEX` (`0` to drop the Codex section).
 
 The app locates the collector at: `$CLAUDE_METER_STATS`, then
 `~/.local/bin/claude-meter-stats`, then `/usr/local/bin/claude-meter-stats`,
@@ -302,6 +347,96 @@ looking at it; it must not be throttled into the background band),
 waits for the binary to exist, looking every five minutes, before `exec`ing it,
 so an agent bootstrapped before the app is built sleeps instead of
 crash-looping.
+
+### Other agentic CLIs
+
+Claude Code is not the only thing on a developer's Mac with a quota. The meter
+shows any other agentic CLI that is **installed** and can report its usage
+**locally** — read from what is already on the machine, or asked of the tool's
+own local server. Nothing here signs anything in, and nothing makes a model
+request to find out how much of a model you have used.
+
+Presence decides everything. A tool the meter cannot find contributes no key to
+the collector's output, so the menu on a Mac without it is identical, item for
+item, to the menu before that tool was ever supported.
+
+#### Codex — supported
+
+[Codex CLI](https://developers.openai.com/codex/cli) reports the quota behind
+its own `/status` panel, and the meter reads it the way Codex itself does.
+
+- **Detected by** a `codex` executable — `PATH` first, then `~/.local/bin`,
+  `/run/current-system/sw/bin`, `/etc/profiles/per-user/$USER/bin`,
+  `~/.nix-profile/bin`, `/opt/homebrew/bin`, `/usr/local/bin` — **and**
+  `$CODEX_HOME` (default `~/.codex`) existing. PATH alone was not enough: a
+  launchd-spawned shell inherits a sparse one, so an installed codex was
+  invisible to the resident meter while being plainly on the developer's own
+  `$PATH`.
+- **Read from** `codex app-server`, the stdio JSON-RPC server Codex ships for
+  its own desktop app. One spawn answers two methods: `account/read` (the
+  account's email and plan, out of `$CODEX_HOME` alone, no network) and
+  `account/rateLimits/read` (the usage read, with `excludeResetCreditDetails`,
+  which the method's own schema describes as the shape for background usage
+  polls). Neither is a model request, so neither spends any quota. The server is
+  spawned per read and killed in a `finally`; it leaves no process and writes no
+  file.
+- **The credential stays Codex's.** `$CODEX_HOME/auth.json` holds the account's
+  OAuth tokens and the meter never opens it — it is checked for *existence*, to
+  tell "signed out" from "not installed", and nothing more. The tokens are used
+  by the app-server, in its own process, exactly as Codex already uses them.
+  Calling `chatgpt.com/backend-api/codex/usage` with a token read out of that
+  file would have been a shorter path and the wrong one.
+- **Shown as** one row per usage window Codex reports (`primary`, then
+  `secondary` when there is one), each with the percentage used, the time to
+  reset, and a label derived from the window's own length — `5h`, `Weekly`,
+  `30-day`. The names are not hardcoded, because they are not stable: a free
+  plan reports a 43200-minute window where a paid plan reports a 300-minute one.
+- **Severity** comes from the same percentage thresholds the Claude limits use
+  (75% warning, 90% critical), because Codex sends none — except for the two
+  states its backend states outright, `rateLimitReachedType` and
+  `spendControlReached`, which are taken as critical whatever the percentage
+  says.
+- **Cached** in `~/.cache/claude-meter/codex-usage.json` (0600; it holds the
+  account email), refreshed at most once per TTL — 120 s while a `codex` process
+  is alive, 900 s when idle — with a 180 s backoff after a failure. `CODEX_HOME`
+  and `CODEX_USAGE_TTL` are honoured; `CLAUDE_METER_CODEX=0` turns the section
+  off entirely.
+
+Nothing about Codex reaches the menu-bar glyph or the number beside it. Those
+are Claude Code's three limits, and a fourth or fifth bar would break the one
+thing the glyph says.
+
+#### Antigravity (`agy`) — not supported, and why
+
+Google's [Antigravity CLI](https://antigravity.google/docs/cli) has quota — the
+TUI's `/usage`, `/quota` and `/credits` panels show it — but **there is no way
+to read it locally**, so the meter does not pretend to. Measured against agy
+1.2.7 on macOS, 2026-09-20:
+
+- No subcommand reports it. The whole 1.2.7 set is `agent`/`agents`,
+  `changelog`, `help`, `install`, `mcp`, `mic-serve`, `models`,
+  `plugin`/`plugins`, `remote-control`, `update`. The quota panels are slash
+  commands *inside* a session, not commands you can run.
+- Nothing persists it. An unauthenticated run writes state, logs, a
+  conversation-summary database and an MCP config under `~/.gemini/`, and no
+  file among them holds a quota number. The quota types
+  (`RetrieveUserQuotaSummary`, `FetchQuotaStatus`, `QuotaSummaryBucket`) are
+  gRPC messages that feed the TUI panels and are not written to disk.
+- Its statusline cannot carry it either. `agy` does have a `/statusline`
+  mechanism, but it is output-only: it runs a shell command and renders that
+  command's stdout. Unlike Claude Code's, it pipes no JSON payload *in*, so
+  there is no quota field for a script to pick up.
+- Without a sign-in nothing is even computed — the CLI's own log says
+  `doRefreshQuota: skipped (not logged in)`, so the gRPC call is never attempted.
+
+**What would unblock it:** a persisted snapshot, the way Claude Code writes
+`cachedUsageUtilization` and Codex answers `account/rateLimits/read` — either a
+local file `agy` writes after a quota refresh, a non-interactive subcommand that
+prints it, or a statusline payload that includes it. Any of the three, and the
+section is the same shape as the Codex one: a `codex_section()` twin in the
+collector and one row in the app's `toolNames` table. Until then, an installed
+`agy` adds nothing to the menu, which is the honest answer rather than a row
+that says "unknown" forever.
 
 ### Bundle identifier and launchd label
 
@@ -418,6 +553,26 @@ The dates in the code comments are what each rule came from. The short version:
 - **2026-09-13, the managed plist.** A flake-managed Mac's LaunchAgents are
   read-only or symlinked into the Nix store; the installer refuses to write over
   one rather than silently taking the agent away from its owner.
+- **2026-09-20, where Codex keeps its quota — and where it does not.** The five
+  sqlite databases under `$CODEX_HOME` hold threads, logs, goals, memories and a
+  queue, and no rate-limit table between them. `codex doctor` reports thirty-odd
+  facts about the install and not one number about usage. The rollout files that
+  *do* carry a `rate_limits` record are written only while a session runs, so a
+  Mac that has not run Codex today has nothing on disk to read. Grepping all of
+  `$CODEX_HOME` for a rate-limit string returned one hit, in an unrelated plugin
+  catalogue. `codex app-server` answered `account/rateLimits/read` in 0.79 s and
+  `account/read` in 0.03 s, and left no process and no file behind.
+- **2026-09-20, the window has no fixed name.** The account this was built
+  against reports a single 43200-minute (30-day) primary window on a free plan,
+  where a paid plan reports 300 minutes. A hardcoded `5h` / `weekly` pair would
+  have been wrong for one of them, so the label is derived from
+  `windowDurationMins`.
+- **2026-09-20, Antigravity has no local number at all.** No subcommand prints
+  it, no file under `~/.gemini` holds it, the statusline mechanism carries no
+  payload into the script it runs, and without a sign-in the CLI's own log says
+  `doRefreshQuota: skipped (not logged in)` — the refresh is never even
+  attempted. Recorded as a blocker rather than engineered around; see
+  [Other agentic CLIs](#other-agentic-clis).
 
 ### Provenance
 
