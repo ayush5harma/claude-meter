@@ -104,9 +104,11 @@ func runUnderThisIdentity(_ argv: [String]) -> Never {
 // a setting on somebody's Mac.
 //
 // The bars are given explicitly rather than collected, so an image in the
-// documentation shows what it says it shows.
+// documentation shows what it says it shows, and they are clamped to 0-100
+// because a percentage is not a free integer.
 //
-// Before any AppKit global, for the same reason as `--run`.
+// Dispatched at the BOTTOM of this file, unlike `--run` -- see the comment
+// there for why the two are on opposite sides of the globals.
 func renderGlyph(_ argv: [String]) -> Never {
     var out = "", bars = [27, 98, 76], appearanceName = "dark"
     var rest = argv[...]
@@ -133,7 +135,7 @@ func renderGlyph(_ argv: [String]) -> Never {
     // out of the Dock and out of the status bar -- a render is not a launch.
     NSApplication.shared.setActivationPolicy(.prohibited)
     NSAppearance.current = NSAppearance(named: appearanceName == "light" ? .aqua : .darkAqua)
-    let limits = bars.map { Limit(pct: $0) }
+    let limits = bars.map { Limit(pct: max(0, min(100, $0))) }
     let image = barsGlyph(limits, groupAfter: limits.count > 3 ? 3 : 0)
     guard let tiff = image.tiffRepresentation,
           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
@@ -286,15 +288,22 @@ enum Type {
 }
 
 enum Metric {
-    static let contentWidth: CGFloat = 340
+    // Scaled by the same factor as the type, because a row is a box around
+    // text: scaling only the type grew the words inside a container that did
+    // not, which the first cut did (PR review, 2026-09-21). The gutter is the
+    // one exception -- a margin is whitespace, not a container, and it reads
+    // the same at any size.
+    static let contentWidth: CGFloat = 340 * Type.scale
     static let gutter: CGFloat = 16
-    static let row: CGFloat = 28            // one window row
-    static let bar: CGFloat = 12            // its gauge
-    static let soloBlock: CGFloat = 56      // a section with exactly one window
-    static let soloBar: CGFloat = 14
-    static let percentColumn: CGFloat = 40
-    static let countdownColumn: CGFloat = 52
-    static let graph: CGFloat = 60
+    static let row: CGFloat = 28 * Type.scale       // one window row
+    static let bar: CGFloat = 12 * Type.scale       // its gauge
+    static let soloBlock: CGFloat = 56 * Type.scale // a section with one window
+    static let soloBar: CGFloat = 14 * Type.scale
+    static let percentColumn: CGFloat = 40 * Type.scale
+    static let countdownColumn: CGFloat = 52 * Type.scale
+    static let graph: CGFloat = 60 * Type.scale
+    static let labelColumnMin: CGFloat = 60 * Type.scale
+    static let labelColumnMax: CGFloat = 120 * Type.scale
 }
 
 // MARK: - Colour
@@ -532,7 +541,7 @@ final class UsageView: NSView {
             max($0, NSAttributedString(string: $1.0, attributes: [.font: UsageView.labelFont])
                 .size().width)
         }
-        return min(120, max(60, widest.rounded(.up) + 10))
+        return min(Metric.labelColumnMax, max(Metric.labelColumnMin, widest.rounded(.up) + 10))
     }
 
     // ONE WINDOW IS NOT THREE WINDOWS. A plan with a single usage window must

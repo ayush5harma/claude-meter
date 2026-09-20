@@ -68,10 +68,18 @@ done
 # on 2026-09-21, where a query for its bundle id returned no rows out of 65 --
 # so nothing has to be re-granted afterwards.
 LEGACY_LABEL="com.ayushsharma.claude-meter"
-LEGACY_APP="$APP_DIR/Claude Meter.app"
+# APPS_DIR, not APP_DIR: the latter is the optional override a caller may
+# set, and reading it under `set -u` aborted every mode of this script --
+# including the install command in the README (PR review, 2026-09-21).
+LEGACY_APP="$APPS_DIR/Claude Meter.app"
 LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
 LEGACY_STATS="$BIN_DIR/claude-meter-stats"
 
+# NOTE FOR ANYONE TESTING THIS: APP_DIR and BIN_DIR sandbox the FILE removals,
+# and nothing sandboxes the `launchctl bootout` below -- the launchd domain is
+# the real user's whatever those are set to. Point it at a scratch directory to
+# check the file logic and it will still stop the agent that is running
+# (learned the hard way, 2026-09-21).
 uninstall_legacy() {
   launchctl bootout "$DOMAIN/$LEGACY_LABEL" >/dev/null 2>&1 \
     && say "unloaded $LEGACY_LABEL" || say "$LEGACY_LABEL was not loaded"
