@@ -160,7 +160,7 @@ check "no model row"      "$(printf '%s' "$out" | field '["details"]')" "['Credi
 
 say "cache version — a cache from an older collector is not a cache"
 mkdir -p "$WORK/cache-stale"
-printf '{"fetched_at": 99999999999, "data": {"email": "old@example.com", "plan": "old", "rate_limits": {}}}' \
+printf '{"v": 2, "fetched_at": 99999999999, "data": {"email": "old@example.com", "plan": "old", "rate_limits": {}}}' \
   >"$WORK/cache-stale/codex-usage.json"
 out="$(collect "$HERE/paid-two-windows.json" stale)"
 check "refetched, not served" "$(printf '%s' "$out" | field '["plan"]')" "pro"

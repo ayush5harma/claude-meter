@@ -614,7 +614,7 @@ CODEX_CACHE = CACHE_DIR / "codex-usage.json"
 # which is exactly what an upgraded collector did on this Mac before the gate
 # existed: correct numbers, no model rows, for fifteen minutes, and nothing on
 # screen to say why (measured 2026-09-21).
-CODEX_CACHE_VERSION = 2
+CODEX_CACHE_VERSION = 3
 CODEX_BACKOFF = CACHE_DIR / "codex-usage.backoff"
 
 # Where a `codex` binary may be, after PATH. A launchd-spawned shell inherits a
