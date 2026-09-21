@@ -544,8 +544,8 @@ func barsGlyph(_ limits: [Limit], groupAfter: Int = 0, badge: NSColor? = nil) ->
 }
 
 // The live status item is three side-by-side provider gauges. The labels are
-// deliberately 10 pt at 1x: smaller text made the names technically present
-// but unreadable, while three 48 pt columns fit in the usual menu bar.
+// abbreviated to keep the three-provider item close to neighboring menu icons.
+// Full names and exact window values remain in the tooltip and accessibility text.
 struct ProviderGauge {
     var name: String
     // Top is the actual short window; bottom is weekly. Either can be absent
@@ -567,32 +567,34 @@ func drawClockBadge(at origin: NSPoint, color: NSColor) {
 }
 
 func providerGaugeGlyph(_ providers: [ProviderGauge], collectorSick: Bool) -> NSImage {
-    let width: CGFloat = 150
-    let column: CGFloat = 48
-    let labelFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+    let width: CGFloat = 84
+    let column: CGFloat = 28
+    let labelFont = NSFont.systemFont(ofSize: 9, weight: .medium)
     let image = NSImage(size: NSSize(width: width, height: menuBarHeight))
     image.lockFocus()
     NSGraphicsContext.current?.shouldAntialias = true
     // Keep the name and its bar as one centred unit. A notched Mac can report
     // a 37 pt status bar; pinning the name to its top and the bar to y=3.5
     // turned one gauge into two unrelated marks there.
-    let stackHeight: CGFloat = 22
+    let stackHeight: CGFloat = 18
     let bottomY = (menuBarHeight - stackHeight) / 2
-    let topY = bottomY + 5.5
-    let labelY = bottomY + 11.5
+    let topY = bottomY + 4
+    let labelY = bottomY + 8
     for (index, provider) in providers.enumerated() {
         let x = CGFloat(index) * column
-        let label = NSAttributedString(string: provider.name, attributes: [
+        let shortName = ["Claude": "Cl", "Codex": "Cx", "Agy": "Agy"][provider.name] ?? provider.name
+        let label = NSAttributedString(string: shortName, attributes: [
             .font: labelFont,
             .foregroundColor: provider.stale ? NSColor.tertiaryLabelColor : NSColor.labelColor,
         ])
-        label.draw(at: NSPoint(x: x, y: labelY))
+        label.draw(at: NSPoint(x: x + (22 - label.size().width) / 2, y: labelY))
         if provider.stale {
-            drawClockBadge(at: NSPoint(x: x + label.size().width + 2, y: labelY + 1.5),
-                           color: .secondaryLabelColor)
+            // A small age dot avoids widening the compact mark; the tooltip explains it.
+            NSColor.secondaryLabelColor.setFill()
+            NSBezierPath(ovalIn: NSRect(x: x + 23, y: labelY + 4, width: 2, height: 2)).fill()
         }
         for (window, y) in zip(provider.windows, [topY, bottomY]) {
-            let bar = NSRect(x: x, y: y, width: 43, height: 3.5)
+            let bar = NSRect(x: x, y: y, width: 22, height: 2.5)
             if let limit = window.1 {
                 let color = provider.stale ? NSColor.tertiaryLabelColor : gaugeColor(limit, index)
                 drawGauge(bar, pct: limit.pct, color: color)
@@ -1164,7 +1166,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     // The image stays compact; VoiceOver and the hover tooltip carry the exact
-    // reading, reset and data age that a 150 pt status item cannot fit.
+    // reading, reset and data age that a 84 pt status item cannot fit.
     private func providerDescription(_ provider: ProviderGauge) -> String {
         let age: Int
         switch provider.name {

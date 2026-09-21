@@ -67,13 +67,13 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** three compact two-bar gauges, labelled `Claude`, `Codex`,
+**In the menu bar:** three compact two-bar gauges, labelled `Cl`, `Cx`,
 and `Agy`, show each provider's short window above its weekly window. The bar
 uses the provider's actual window metadata: a 5-hour quota is never called
 daily, and a 30-day plan does not fill the weekly position. An outlined track
 with a dash means that provider has not reported that window. Orange means that provider is at least 75% used
 and red means that provider is at least 90% used, so one hot quota never makes
-the other gauges look urgent. A dim gauge with a tiny clock means only that
+the other gauges look urgent. A dim gauge with a small age dot means only that
 provider's reading is stale; a red corner warning is reserved for a collector
 problem. Hover for exact percentages, ages, and reset times; click for
 individual windows and reset times.
