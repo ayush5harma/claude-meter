@@ -58,6 +58,7 @@ check() {
 
 # `jq` is not assumed: python3 is already a hard dependency of the collector.
 field() { python3 -c 'import json,sys; print(json.loads(sys.stdin.read())["codex"]'"$1"')' 2>&1; }
+codex_expr() { python3 -c 'import json,sys; c=json.loads(sys.stdin.read())["codex"]; print(eval(sys.argv[1], {}, {"c":c}))' "$1" 2>&1; }
 
 say() { printf '\n%s\n' "$*"; }
 
@@ -65,6 +66,8 @@ say "free-single-window — the shape this fleet's own account reports"
 out="$(collect "$HERE/free-single-window.json" free)"
 check "one window"        "$(printf '%s' "$out" | field '["limits"].__len__()')" "1"
 check "labelled 30-day"   "$(printf '%s' "$out" | field '["limits"][0]["label"]')" "30-day"
+check "30-day duration"   "$(printf '%s' "$out" | field '["limits"][0]["duration_mins"]')" "43200"
+check "30-day not weekly" "$(printf '%s' "$out" | codex_expr '"cadence" in c["limits"][0]')" "False"
 check "plan free"         "$(printf '%s' "$out" | field '["plan"]')" "free"
 check "no details yet"    "$(printf '%s' "$out" | field '.get("details", ["Model: GPT-5.6-Terra"])[0]')" "Model: GPT-5.6-Terra"
 
@@ -73,6 +76,8 @@ out="$(collect "$HERE/paid-two-windows.json" paid)"
 check "two windows"       "$(printf '%s' "$out" | field '["limits"].__len__()')" "2"
 check "first is 5h"       "$(printf '%s' "$out" | field '["limits"][0]["label"]')" "5h"
 check "second is Weekly"  "$(printf '%s' "$out" | field '["limits"][1]["label"]')" "Weekly"
+check "5h metadata"       "$(printf '%s' "$out" | codex_expr '(c["limits"][0]["duration_mins"], c["limits"][0]["cadence"])')" "(300, 'short')"
+check "weekly metadata"   "$(printf '%s' "$out" | codex_expr '(c["limits"][1]["duration_mins"], c["limits"][1]["cadence"])')" "(10080, 'weekly')"
 check "5h percentage"     "$(printf '%s' "$out" | field '["limits"][0]["pct"]')" "42"
 check "weekly percentage" "$(printf '%s' "$out" | field '["limits"][1]["pct"]')" "7"
 check "5h counts down"    "$(printf '%s' "$out" | field '["limits"][0]["reset_in"] > 0')" "True"
@@ -87,10 +92,26 @@ out="$(collect "$HERE/multi-bucket.json" multi)"
 check "four windows"      "$(printf '%s' "$out" | field '["limits"].__len__()')" "4"
 check "bucket named"      "$(printf '%s' "$out" | field '["limits"][0]["label"]')" "Agents Hourly"
 check "codex 5h named"    "$(printf '%s' "$out" | field '["limits"][2]["label"]')" "Codex 5h"
+check "bucket durations"  "$(printf '%s' "$out" | codex_expr '[(x["duration_mins"], x.get("cadence")) for x in c["limits"]]')" "[(60, 'short'), (43200, None), (300, 'short'), (10080, 'weekly')]"
 check "reached=critical"  "$(printf '%s' "$out" | field '["limits"][2]["severity"]')" "critical"
 check "other bucket calm" "$(printf '%s' "$out" | field '["limits"][0]["severity"]')" "normal"
 check "state in words"    "$(printf '%s' "$out" | field '["details"][0]')" "Rate limit reached"
 check "unlimited credits" "$(printf '%s' "$out" | field '["details"][1]')" "Credits: unlimited"
+
+say "missing duration — metadata stays optional"
+python3 - "$HERE/paid-two-windows.json" "$WORK/missing-duration.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+usage = data["account/rateLimits/read"]
+for snapshot in [usage.get("rateLimits", {})] + list((usage.get("rateLimitsByLimitId") or {}).values()):
+    for key in ("primary", "secondary"):
+        if isinstance(snapshot.get(key), dict):
+            snapshot[key].pop("windowDurationMins", None)
+json.dump(data, open(sys.argv[2], "w"))
+PY
+out="$(collect "$WORK/missing-duration.json" missing-duration)"
+check "unknown labels remain" "$(printf '%s' "$out" | codex_expr '[x["label"] for x in c["limits"]]')" "['Limit', 'Limit']"
+check "unknown has no metadata" "$(printf '%s' "$out" | codex_expr '[set(x) & {"duration_mins", "cadence"} for x in c["limits"]]')" "[set(), set()]"
 
 say "config.toml — the top-level model key, and the three stops that guard it"
 # Each case writes a config.toml and asserts what reached the MENU, which is
@@ -139,7 +160,7 @@ check "no model row"      "$(printf '%s' "$out" | field '["details"]')" "['Credi
 
 say "cache version — a cache from an older collector is not a cache"
 mkdir -p "$WORK/cache-stale"
-printf '{"fetched_at": 99999999999, "data": {"email": "old@example.com", "plan": "old", "rate_limits": {}}}' \
+printf '{"v": 2, "fetched_at": 99999999999, "data": {"email": "old@example.com", "plan": "old", "rate_limits": {}}}' \
   >"$WORK/cache-stale/codex-usage.json"
 out="$(collect "$HERE/paid-two-windows.json" stale)"
 check "refetched, not served" "$(printf '%s' "$out" | field '["plan"]')" "pro"

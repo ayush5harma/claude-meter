@@ -5,21 +5,21 @@ the code can be checked against it.
 
 ## What the menu-bar item promises
 
-**How close is each provider to being stopped.** Each provider's tightest
-window has its own labelled gauge, so a hot quota is visible before you click
-without obscuring the other providers.
+**How close is each provider to being stopped.** Each provider has a labelled
+short-window gauge above a weekly gauge, so a hot quota is visible before you
+click without obscuring the other providers.
 
 Everything else is the dropdown. The item is read in a saccade; the dropdown is
 read deliberately.
 
 ## The glyph
 
-Three 48 pt columns use the full `Claude`, `Codex`, and `agy` labels at 10 pt,
-above a 43 pt horizontal gauge. The status item is 150 pt wide. Each label and
-bar form a centred 17.5 pt stack, so the group stays together on both a 22 pt
-menu bar and a taller notched bar. The track is outlined with a dash when that
-provider has not reported a quota. Exact percentages, ages, and reset times
-belong in the hover tooltip and dropdown.
+Three 48 pt columns use the full `Claude`, `Codex`, and `Agy` labels at 10 pt,
+above two 43 pt horizontal gauges. The upper bar is the provider's actual short
+window and the lower bar is weekly; the label and bars form a centred 22 pt
+stack in the 150 pt status item. A 30-day or unknown cadence leaves the weekly
+bar outlined with a dash rather than being relabelled. Exact window names,
+percentages, ages, and reset times belong in the hover tooltip and dropdown.
 
 A stale provider dims only its own label and gauge and gains a tiny clock. A
 red corner warning is for a collector failure, never a quota level or one

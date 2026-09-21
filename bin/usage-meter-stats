@@ -89,7 +89,7 @@ export PATH
 # future edit from balancing apostrophes.
 py_out="$(mktemp)"
 python3 - <<'PY' >"$py_out" 2>/dev/null
-import json, pathlib, datetime, hashlib, math, os, queue, shutil, signal, subprocess, threading, time
+import json, pathlib, datetime, hashlib, math, os, queue, re, shutil, signal, subprocess, threading, time
 from collections import namedtuple
 
 HOME = pathlib.Path.home()
@@ -614,7 +614,7 @@ CODEX_CACHE = CACHE_DIR / "codex-usage.json"
 # which is exactly what an upgraded collector did on this Mac before the gate
 # existed: correct numbers, no model rows, for fifteen minutes, and nothing on
 # screen to say why (measured 2026-09-21).
-CODEX_CACHE_VERSION = 2
+CODEX_CACHE_VERSION = 3
 CODEX_BACKOFF = CACHE_DIR / "codex-usage.backoff"
 
 # Where a `codex` binary may be, after PATH. A launchd-spawned shell inherits a
@@ -795,6 +795,22 @@ def codex_window_label(minutes):
     return ("%dm" % minutes)[:12]
 
 
+def codex_window_metadata(minutes):
+    """Optional cadence metadata from the server's declared window length.
+
+    Reset time is deliberately excluded: a weekly window near reset can have
+    less time remaining than a short window and must not change categories.
+    """
+    if not minutes or minutes <= 0:
+        return {}
+    result = {"duration_mins": minutes}
+    if minutes <= 1440:
+        result["cadence"] = "short"
+    elif minutes == 10080:
+        result["cadence"] = "weekly"
+    return result
+
+
 def codex_snapshot_limits(rate_limits, prefix=""):
     """Every window in ONE rate-limit snapshot, in the order codex reports it.
     `usedPercent` is a percentage of the ceiling that actually stops you, the
@@ -816,8 +832,9 @@ def codex_snapshot_limits(rate_limits, prefix=""):
             continue          # a window with no percentage is not a window
         used = max(0, min(100, used))
         resets_at = codex_int(window.get("resetsAt"))
-        label = codex_window_label(codex_int(window.get("windowDurationMins")))
-        limits.append({
+        duration = codex_int(window.get("windowDurationMins"))
+        label = codex_window_label(duration)
+        emitted = {
             "label": (prefix + " " + label).strip(),
             "pct": used,
             # An epoch-seconds instant here, where the Claude side gets an ISO
@@ -825,7 +842,9 @@ def codex_snapshot_limits(rate_limits, prefix=""):
             # rather than a negative countdown.
             "reset_in": max(0, int(resets_at - NOW)) if resets_at else 0,
             "severity": "critical" if reached else "normal",
-        })
+        }
+        emitted.update(codex_window_metadata(duration))
+        limits.append(emitted)
     return limits
 
 
@@ -1234,9 +1253,20 @@ def agy_section():
             continue
         if not isinstance(reset, int) or isinstance(reset, bool) or reset < 0:
             reset = 0
-        limits.append({"label": str(item.get("name") or "Quota")[:80],
-                       "pct": used, "reset_in": max(0, reset - max(0, int(NOW - saved_at))),
-                       "severity": "critical" if used >= 90 else "warning" if used >= 75 else "normal"})
+        label = str(item.get("name") or "Quota")[:80]
+        emitted = {
+            "label": label,
+            "pct": used,
+            "reset_in": max(0, reset - max(0, int(NOW - saved_at))),
+            "severity": "critical" if used >= 90 else "warning" if used >= 75 else "normal",
+        }
+        normalized = label.lower()
+        if re.search(r"(?:^|[^a-z])week(?:ly)?(?:$|[^a-z])", normalized):
+            emitted["cadence"] = "weekly"
+        elif "daily" in normalized or re.search(r"(?:^|[^a-z0-9])day(?:$|[^a-z0-9])", normalized) \
+                or re.search(r"(?:^|[^0-9])\d+h(?:$|[^a-z0-9])", normalized):
+            emitted["cadence"] = "short"
+        limits.append(emitted)
     if not limits:
         return {"ok": False, "note": "agy has not reported a quota yet"}
     details = []
