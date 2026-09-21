@@ -19,10 +19,10 @@
 // thing making a number readable; a number goes warning-coloured only when a
 // limit is actually hot.
 //
-// ONE METER, EVERY AGENT. A provider name makes every number self-explanatory:
-// `Claude 42% · Codex 16% · agy 61%`. A dash means this provider has not
-// reported a quota. Each percentage is warning-coloured independently; a hot
-// Claude limit must not paint Codex or agy red.
+// ONE METER, EVERY AGENT. Three named gauges make the providers readable
+// without a sentence that consumes the whole menu bar. A blank track with a
+// dash means that provider has not reported a quota. Each gauge is coloured
+// independently; a hot Claude limit must not paint Codex or agy red.
 //
 // ROTATING BETWEEN TOOLS WAS REJECTED and it was not close: a value that
 // changes while nothing changed is noise, and a meter that is sometimes
@@ -499,6 +499,100 @@ func barsGlyph(_ limits: [Limit], groupAfter: Int = 0, badge: NSColor? = nil) ->
     return image
 }
 
+// The live status item is three side-by-side provider gauges. The labels are
+// deliberately 10 pt at 1x: smaller text made the names technically present
+// but unreadable, while three 48 pt columns fit in the usual menu bar.
+struct ProviderGauge {
+    var name: String
+    var limit: Limit?
+    var stale = false
+}
+
+func drawClockBadge(at origin: NSPoint, color: NSColor) {
+    let rect = NSRect(x: origin.x, y: origin.y, width: 5, height: 5)
+    color.setStroke()
+    NSBezierPath(ovalIn: rect).stroke()
+    let hand = NSBezierPath()
+    hand.move(to: NSPoint(x: rect.midX, y: rect.midY))
+    hand.line(to: NSPoint(x: rect.midX, y: rect.midY + 1.4))
+    hand.move(to: NSPoint(x: rect.midX, y: rect.midY))
+    hand.line(to: NSPoint(x: rect.midX + 1.15, y: rect.midY - 0.65))
+    hand.stroke()
+}
+
+func providerGaugeGlyph(_ providers: [ProviderGauge], collectorSick: Bool) -> NSImage {
+    let width: CGFloat = 150
+    let column: CGFloat = 48
+    let labelFont = NSFont.systemFont(ofSize: 10, weight: .medium)
+    let image = NSImage(size: NSSize(width: width, height: menuBarHeight))
+    image.lockFocus()
+    NSGraphicsContext.current?.shouldAntialias = true
+    // Keep the name and its bar as one centred unit. A notched Mac can report
+    // a 37 pt status bar; pinning the name to its top and the bar to y=3.5
+    // turned one gauge into two unrelated marks there.
+    let stackHeight: CGFloat = 17.5
+    let barY = (menuBarHeight - stackHeight) / 2
+    let labelY = barY + 5.5
+    for (index, provider) in providers.enumerated() {
+        let x = CGFloat(index) * column
+        let label = NSAttributedString(string: provider.name, attributes: [
+            .font: labelFont,
+            .foregroundColor: provider.stale ? NSColor.tertiaryLabelColor : NSColor.labelColor,
+        ])
+        label.draw(at: NSPoint(x: x, y: labelY))
+        if provider.stale {
+            drawClockBadge(at: NSPoint(x: x + label.size().width + 2, y: labelY + 1.5),
+                           color: .secondaryLabelColor)
+        }
+        let bar = NSRect(x: x, y: barY, width: 43, height: 3.5)
+        if let limit = provider.limit {
+            let color = provider.stale ? NSColor.tertiaryLabelColor : gaugeColor(limit, index)
+            drawGauge(bar, pct: limit.pct, color: color)
+        } else {
+            NSColor.quaternaryLabelColor.setStroke()
+            NSBezierPath(roundedRect: bar, xRadius: bar.height / 2, yRadius: bar.height / 2).stroke()
+            let dash = NSAttributedString(string: "—", attributes: [
+                .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+                .foregroundColor: NSColor.tertiaryLabelColor,
+            ])
+            dash.draw(at: NSPoint(x: bar.midX - dash.size().width / 2, y: barY - 3))
+        }
+    }
+    if collectorSick {
+        let badge = NSBezierPath()
+        badge.move(to: NSPoint(x: width - 7, y: menuBarHeight - 1))
+        badge.line(to: NSPoint(x: width - 1, y: menuBarHeight - 1))
+        badge.line(to: NSPoint(x: width - 1, y: menuBarHeight - 7))
+        badge.close()
+        muted(.systemRed).setFill()
+        badge.fill()
+    }
+    image.unlockFocus()
+    image.isTemplate = false
+    return image
+}
+
+// A deterministic rendering path for design review. It draws the exact live
+// status-item geometry without opening a status item or reading a real quota.
+func renderMenuPreview(_ argv: [String]) -> Never {
+    guard let out = argv.first, !out.isEmpty else {
+        FileHandle.standardError.write(Data("usage: UsageMeter --menu-preview <out.png>\n".utf8))
+        exit(64)
+    }
+    NSApplication.shared.setActivationPolicy(.prohibited)
+    let image = providerGaugeGlyph([
+        ProviderGauge(name: "Claude", limit: Limit(pct: 42), stale: false),
+        ProviderGauge(name: "Codex", limit: Limit(pct: 21), stale: false),
+        ProviderGauge(name: "agy", limit: Limit(pct: 1), stale: true),
+    ], collectorSick: false)
+    guard let tiff = image.tiffRepresentation,
+          let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
+        exit(70)
+    }
+    do { try png.write(to: URL(fileURLWithPath: out)) } catch { exit(73) }
+    exit(0)
+}
+
 // MARK: - Dropdown view
 
 // The click-through view: full-size colourful progress bars for the three
@@ -786,9 +880,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     // 45 min covers the collector's worst normal cadence (900s idle TTL plus a
     // failed attempt's backoff); older than that means refresh is broken.
-    private var dataStale: Bool {
-        (stats.ok && dataAge >= 45 * 60) || numericTools.contains { toolDataAge($0) >= 45 * 60 }
-    }
+    private var claudeDataStale: Bool { stats.ok && dataAge >= 45 * 60 }
 
     func applicationDidFinishLaunching(_: Notification) {
         // SINGLE INSTANCE. A launchd agent owns this app, so any second copy —
@@ -818,9 +910,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         statusItem.menu = statusMenu
         if let button = statusItem.button {
-            button.image = nil
-            button.attributedTitle = barText("Collecting usage…", .secondaryLabelColor)
+            button.imagePosition = .imageOnly
+            button.attributedTitle = NSAttributedString(string: "")
+            button.image = providerGaugeGlyph([
+                ProviderGauge(name: "Claude"), ProviderGauge(name: "Codex"), ProviderGauge(name: "agy"),
+            ], collectorSick: false)
             button.toolTip = "Quota used — collecting readings"
+            button.setAccessibilityLabel("Quota used — collecting readings")
         }
         refresh()
 
@@ -981,51 +1077,45 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func render() {
         guard let button = statusItem.button else { return }
-        button.image = nil
-        let title = statusTitle(dimForFreshness: dataStale || collectorSick)
-        if collectorSick {
-            title.append(barText(" · check", .systemRed))
-        } else if dataStale {
-            title.append(barText(" · stale", .secondaryLabelColor))
-        }
-        button.attributedTitle = title
-        let cause = collectorSick ? " — \(lastError ?? "collector needs attention")" :
-            (dataStale ? " — data is stale" : "")
-        button.toolTip = "Quota used — \(title.string)\(cause)"
+        button.attributedTitle = NSAttributedString(string: "")
+        let gauges = providerGauges()
+        button.image = providerGaugeGlyph(gauges, collectorSick: collectorSick)
+        let description = gauges.map { providerDescription($0) }.joined(separator: "; ")
+        let health = collectorSick ? "; collector needs attention: \(lastError ?? "no recent reading")" : ""
+        let label = "Quota used — \(description)\(health)"
+        button.toolTip = label
+        button.setAccessibilityLabel(label)
     }
 
-    // The meter's own health, never a limit — see barsGlyph.
-    private func badgeColor() -> NSColor? {
-        if collectorSick { return muted(.systemRed) }
-        return dataStale ? muted(.systemYellow) : nil
-    }
-
-    // Show every provider in words. The dropdown keeps each tool's full window
-    // breakdown and reset times; this is the one unambiguous glanceable value.
-    private func statusTitle(dimForFreshness: Bool) -> NSMutableAttributedString {
+    private func providerGauges() -> [ProviderGauge] {
         let claudeLimits = [stats.session, stats.weekly, stats.scoped]
         let claudeWorst = stats.ok ? claudeLimits.max {
             (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct)
         } : nil
-        let readings: [(String, Limit?)] = [
-            ("Claude", claudeWorst),
-            ("Codex", tools.first(where: { $0.name == "Codex" && $0.ok })?.worst),
-            ("agy", tools.first(where: { $0.name == "Antigravity" && $0.ok })?.worst),
+        let codex = tools.first(where: { $0.name == "Codex" && $0.ok })
+        let agy = tools.first(where: { $0.name == "Antigravity" && $0.ok })
+        return [
+            ProviderGauge(name: "Claude", limit: claudeWorst, stale: claudeDataStale),
+            ProviderGauge(name: "Codex", limit: codex?.worst,
+                          stale: codex.map { toolDataAge($0) >= 45 * 60 } ?? false),
+            ProviderGauge(name: "agy", limit: agy?.worst,
+                          stale: agy.map { toolDataAge($0) >= 45 * 60 } ?? false),
         ]
-        let title = NSMutableAttributedString()
-        for (index, entry) in readings.enumerated() {
-            if index > 0 { title.append(barText(" · ", .secondaryLabelColor)) }
-            let value = entry.1.map { " \($0.pct)%" } ?? " —"
-            let color: NSColor
-            if dimForFreshness {
-                color = .secondaryLabelColor
-            } else {
-                color = entry.1.map { alertLevel($0) == .normal ? NSColor.labelColor : gaugeColor($0, 0) }
-                    ?? .secondaryLabelColor
-            }
-            title.append(barText(entry.0 + value, color))
+    }
+
+    // The image stays compact; VoiceOver and the hover tooltip carry the exact
+    // reading, reset and data age that a 150 pt status item cannot fit.
+    private func providerDescription(_ provider: ProviderGauge) -> String {
+        guard let limit = provider.limit else { return "\(provider.name) unavailable" }
+        let age: Int
+        switch provider.name {
+        case "Claude": age = dataAge
+        case "Codex": age = tools.first(where: { $0.name == "Codex" }).map(toolDataAge) ?? -1
+        default: age = tools.first(where: { $0.name == "Antigravity" }).map(toolDataAge) ?? -1
         }
-        return title
+        let freshness = provider.stale ? "stale, read \(formatAge(age))" : "read \(formatAge(age))"
+        let reset = limit.resetIn > 0 ? ", resets in \(formatSpan(limit.resetIn))" : ""
+        return "\(provider.name) \(limit.pct)%\(reset), \(freshness)"
     }
 
     // MARK: Menu (rebuilt at open, so ages are computed when eyes are on them)
@@ -1134,12 +1224,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func addFreshnessRows(_ menu: NSMenu) {
         // Say where the numbers CAME FROM and how old they are — the age of the
         // data, not of the last poll, is what decides whether to trust them.
-        if stats.source == "api" && !dataStale {
+        if stats.source == "api" && !claudeDataStale {
             addNote(menu, "Usage API · fetched \(formatAge(dataAge))")
         } else {
             let age = formatAge(dataAge).replacingOccurrences(of: " ago", with: "")
             addNote(menu, "Data \(age) old · from \(stats.source == "api" ? "usage API" : "claude's session cache")",
-                    color: dataStale ? .systemOrange : .secondaryLabelColor)
+                    color: claudeDataStale ? .systemOrange : .secondaryLabelColor)
         }
         // A down live path is stated with its reason and retry time — a silent
         // fallback is indistinguishable from freshness, which is the one lie a
@@ -1197,6 +1287,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 // 2026-09-21). `--run` must be first because it must NOT touch them; this must
 // be last because it must.
 if cliArgs.first == "--glyph" { renderGlyph(Array(cliArgs.dropFirst())) }
+if cliArgs.first == "--menu-preview" { renderMenuPreview(Array(cliArgs.dropFirst())) }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()

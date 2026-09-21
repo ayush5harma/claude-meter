@@ -5,29 +5,25 @@ the code can be checked against it.
 
 ## What the menu-bar item promises
 
-**How close am I to being stopped, by anything.** Not how much I have used —
-used is only meaningful against a ceiling — and not which tool is busiest.
-One glyph and one compact number per installed agent. If any quota is close
-to its ceiling, its own label is already visible before you click.
+**How close is each provider to being stopped.** Each provider's tightest
+window has its own labelled gauge, so a hot quota is visible before you click
+without obscuring the other providers.
 
 Everything else is the dropdown. The item is read in a saccade; the dropdown is
 read deliberately.
 
 ## The glyph
 
-Claude's windows, then one bar per other tool that has a number, after a wider
-gap. Width is fixed at 16 pt for every configuration, so adding a tool never
-moves anything else in the menu bar; the stack gets denser instead. Measured on
-a 22 pt menu bar: three bars at 2.600 pt (unscaled), four at 2.508, five at
-1.956.
+Three 48 pt columns use the full `Claude`, `Codex`, and `agy` labels at 10 pt,
+above a 43 pt horizontal gauge. The status item is 150 pt wide. Each label and
+bar form a centred 17.5 pt stack, so the group stays together on both a 22 pt
+menu bar and a taller notched bar. The track is outlined with a dash when that
+provider has not reported a quota. Exact percentages, ages, and reset times
+belong in the hover tooltip and dropdown.
 
-The adjacent labels show each installed agent's tightest window: `Cl42 Cd16
-Ag61`. The glyph retains Claude's three windows and adds a bar for Codex and
-agy when they have data. A dash means no quota has been reported yet.
-
-Rejected: one bar for the tightest window across all tools (throws away two
-legible limits on the commonest Mac); one bar per tool uniformly (same, weaker);
-rotating (a value that changes while nothing changed is noise).
+A stale provider dims only its own label and gauge and gains a tiny clock. A
+red corner warning is for a collector failure, never a quota level or one
+provider's stale reading.
 
 ## The grid
 
@@ -71,8 +67,9 @@ not shift the column.
 2. **Level** — muted orange at ≥75% or a `warning` severity, muted red at ≥90%
    or `critical`. It overrides the series colour, because danger is never
    traded for prettiness.
-3. **Meter health** — a dot at the top right of the glyph, yellow when the data
-   is over 45 minutes old, red when the collector itself is failing.
+3. **Meter health** — each provider's gauge dims and gains a tiny clock when
+   its own data is over 45 minutes old; a red corner warning is reserved for a
+   collector failure affecting the meter itself.
 
 Everything *drawn* is muted (blended 38% toward mid-grey): full-saturation
 system colours shout beside the bar's monochrome template icons, and a meter is
