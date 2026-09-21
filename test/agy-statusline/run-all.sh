@@ -12,13 +12,17 @@ export HOME="$tmp/home" GEMINI_HOME="$tmp/home/.gemini"
 export PATH="$tmp/bin:$PATH" USAGE_METER_CACHE_DIR="$tmp/home/.cache/usage-meter"
 export USAGE_METER_CODEX=0 USAGE_METER_CONFIG_DIRS="$tmp/home/no-claude"
 
-printf '%s\n' '{"model":{"display_name":"Gemini Pro"},"plan_tier":"Pro","quota":{"weekly":{"remaining_fraction":0.16,"reset_in_seconds":3600},"daily":{"remaining_fraction":0.6,"reset_in_seconds":400}}}' \
+printf '%s\n' '{"model":{"display_name":"Gemini Pro"},"plan_tier":"Pro","quota":{"weekly":{"remaining_fraction":0.16,"reset_in_seconds":3600},"daily":{"remaining_fraction":0.6,"reset_in_seconds":400},"gemini-5h":{"remaining_fraction":0.7,"reset_in_seconds":200},"mystery":{"remaining_fraction":0.8,"reset_in_seconds":100}}}' \
   | "$root/bin/agy-usage-statusline" > "$tmp/status"
 rg -q 'quota 84%' "$tmp/status"
 test "$(stat -f %Lp "$USAGE_METER_CACHE_DIR/agy-quota.json")" = 600
 "$root/bin/usage-meter-stats" > "$tmp/collector"
-jq -e '.agy.ok == true and (.agy.limits | length) == 2 and
+jq -e '.agy.ok == true and (.agy.limits | length) == 4 and
        (.agy.limits[] | select(.label == "weekly") | .pct) == 84 and
+       (.agy.limits[] | select(.label == "weekly") | .cadence) == "weekly" and
+       (.agy.limits[] | select(.label == "daily") | .cadence) == "short" and
+       (.agy.limits[] | select(.label == "gemini-5h") | .cadence) == "short" and
+       ((.agy.limits[] | select(.label == "mystery")) | has("cadence") | not) and
        .agy.source == "agy status line"' "$tmp/collector" >/dev/null
 
 # Empty or malformed updates leave the last real quota in place.
