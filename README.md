@@ -66,12 +66,14 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** the label says exactly what quota is used: `Claude 42% · Codex
-16% · agy 61%`. Every provider stays visible; a dash means it has not reported
-a quota yet. Orange means that provider is at least 75% used and red means that
-provider is at least 90% used, so one hot quota never makes every percentage
-look urgent. The tooltip also names stale data or a collector problem. Click
-for individual windows and reset times.
+**In the menu bar:** three compact gauges, labelled `Claude`, `Codex`, and `agy`,
+show each provider's tightest quota window. An outlined track with a dash means that provider
+has not reported a quota yet. Orange means that provider is at least 75% used
+and red means that provider is at least 90% used, so one hot quota never makes
+the other gauges look urgent. A dim gauge with a tiny clock means only that
+provider's reading is stale; a red corner warning is reserved for a collector
+problem. Hover for exact percentages, ages, and reset times; click for
+individual windows and reset times.
 
 **In the dropdown:** one section per installed tool, in a fixed order, each
 with the same four parts in the same places, so the eye learns one layout:
