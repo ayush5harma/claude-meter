@@ -2,9 +2,9 @@
 // utilisation: the 5-hour session window, the weekly all-models window and the
 // weekly premium-model ("scoped") window, each against its real ceiling.
 //
-// GLANCEABLE, NOT A WALL. The bar names each provider and shows its tightest
-// percentage. The detail (per-limit bars, resets, history graph) lives in the
-// dropdown, rebuilt fresh every time it opens.
+// GLANCEABLE, NOT A WALL. The bar names each provider and shows its actual
+// short window above its weekly window. The detail (every limit, resets,
+// history graph) lives in the dropdown, rebuilt fresh every time it opens.
 //
 // A STALE METER MUST LOOK STALE. The collector can fail (network down, the
 // usage endpoint rate-limiting) and the OS can sleep for days, so the app
@@ -155,7 +155,14 @@ let cacheDir = FileManager.default.homeDirectoryForCurrentUser
 
 // MARK: - Model
 
-struct Limit { var pct = 0; var resetIn = 0; var severity = "normal" }
+struct Limit {
+    var pct = 0, resetIn = 0
+    var severity = "normal"
+    // Duration/cadence describes the quota window itself. resetIn is merely
+    // time remaining and must never be used to decide which bar is short.
+    var durationMins: Int?
+    var cadence = ""
+}
 
 struct Stats {
     var ok = false
@@ -206,6 +213,43 @@ struct ToolReading {
     var worst: Limit? {
         limits.map { $0.1 }.max { (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct) }
     }
+}
+
+// Compact status gauges aggregate only windows whose cadence is known from the
+// provider. This is intentionally separate from resetIn: a weekly limit near
+// its reset is not a short quota window.
+func compactToolWindows(_ limits: [(String, Limit)]) -> [(String, Limit?)] {
+    func classOf(_ limit: Limit) -> Int? {
+        switch limit.cadence {
+        case "short": return 0
+        case "weekly": return 1
+        default:
+            guard let minutes = limit.durationMins, minutes > 0 else { return nil }
+            if minutes <= 1440 { return 0 }
+            return minutes == 10080 ? 1 : nil
+        }
+    }
+    func strongest(_ values: [(String, Limit)]) -> (String, Limit)? {
+        values.max { (alertLevel($0.1), $0.1.pct) < (alertLevel($1.1), $1.1.pct) }
+    }
+    let short = strongest(limits.filter { classOf($0.1) == 0 })
+    let long = strongest(limits.filter { classOf($0.1) == 1 })
+    return [(short?.0 ?? "Short window", short?.1), (long?.0 ?? "Weekly", long?.1)]
+}
+
+// Design-review fixtures exercise the real compact selection rule whenever the
+// deterministic preview is rendered. A monthly limit must not masquerade as a
+// week just because it has a long reset, while a weekly limit near reset still
+// belongs in the lower bar.
+func verifyCompactWindowSelection() {
+    let short = Limit(pct: 12, resetIn: 60, durationMins: 300, cadence: "short")
+    let weeklyNearReset = Limit(pct: 44, resetIn: 1, durationMins: 10080, cadence: "weekly")
+    let monthly = Limit(pct: 77, resetIn: 600, durationMins: 43200)
+    let selected = compactToolWindows([("5h", short), ("Weekly", weeklyNearReset), ("30-day", monthly)])
+    precondition(selected[0].0 == "5h" && selected[0].1?.pct == 12)
+    precondition(selected[1].0 == "Weekly" && selected[1].1?.pct == 44)
+    let monthlyOnly = compactToolWindows([("30-day", monthly)])
+    precondition(monthlyOnly[0].1 == nil && monthlyOnly[1].1 == nil)
 }
 
 // Everything one collector run produced.
@@ -504,7 +548,9 @@ func barsGlyph(_ limits: [Limit], groupAfter: Int = 0, badge: NSColor? = nil) ->
 // but unreadable, while three 48 pt columns fit in the usual menu bar.
 struct ProviderGauge {
     var name: String
-    var limit: Limit?
+    // Top is the actual short window; bottom is weekly. Either can be absent
+    // without pretending it is 0%.
+    var windows: [(String, Limit?)]
     var stale = false
 }
 
@@ -530,9 +576,10 @@ func providerGaugeGlyph(_ providers: [ProviderGauge], collectorSick: Bool) -> NS
     // Keep the name and its bar as one centred unit. A notched Mac can report
     // a 37 pt status bar; pinning the name to its top and the bar to y=3.5
     // turned one gauge into two unrelated marks there.
-    let stackHeight: CGFloat = 17.5
-    let barY = (menuBarHeight - stackHeight) / 2
-    let labelY = barY + 5.5
+    let stackHeight: CGFloat = 22
+    let bottomY = (menuBarHeight - stackHeight) / 2
+    let topY = bottomY + 5.5
+    let labelY = bottomY + 11.5
     for (index, provider) in providers.enumerated() {
         let x = CGFloat(index) * column
         let label = NSAttributedString(string: provider.name, attributes: [
@@ -544,18 +591,20 @@ func providerGaugeGlyph(_ providers: [ProviderGauge], collectorSick: Bool) -> NS
             drawClockBadge(at: NSPoint(x: x + label.size().width + 2, y: labelY + 1.5),
                            color: .secondaryLabelColor)
         }
-        let bar = NSRect(x: x, y: barY, width: 43, height: 3.5)
-        if let limit = provider.limit {
-            let color = provider.stale ? NSColor.tertiaryLabelColor : gaugeColor(limit, index)
-            drawGauge(bar, pct: limit.pct, color: color)
-        } else {
-            NSColor.quaternaryLabelColor.setStroke()
-            NSBezierPath(roundedRect: bar, xRadius: bar.height / 2, yRadius: bar.height / 2).stroke()
-            let dash = NSAttributedString(string: "—", attributes: [
-                .font: NSFont.systemFont(ofSize: 9, weight: .regular),
-                .foregroundColor: NSColor.tertiaryLabelColor,
-            ])
-            dash.draw(at: NSPoint(x: bar.midX - dash.size().width / 2, y: barY - 3))
+        for (window, y) in zip(provider.windows, [topY, bottomY]) {
+            let bar = NSRect(x: x, y: y, width: 43, height: 3.5)
+            if let limit = window.1 {
+                let color = provider.stale ? NSColor.tertiaryLabelColor : gaugeColor(limit, index)
+                drawGauge(bar, pct: limit.pct, color: color)
+            } else {
+                NSColor.quaternaryLabelColor.setStroke()
+                NSBezierPath(roundedRect: bar, xRadius: bar.height / 2, yRadius: bar.height / 2).stroke()
+                let dash = NSAttributedString(string: "—", attributes: [
+                    .font: NSFont.systemFont(ofSize: 9, weight: .regular),
+                    .foregroundColor: NSColor.tertiaryLabelColor,
+                ])
+                dash.draw(at: NSPoint(x: bar.midX - dash.size().width / 2, y: bar.midY - 4))
+            }
         }
     }
     if collectorSick {
@@ -580,10 +629,11 @@ func renderMenuPreview(_ argv: [String]) -> Never {
         exit(64)
     }
     NSApplication.shared.setActivationPolicy(.prohibited)
+    verifyCompactWindowSelection()
     let image = providerGaugeGlyph([
-        ProviderGauge(name: "Claude", limit: Limit(pct: 42), stale: false),
-        ProviderGauge(name: "Codex", limit: Limit(pct: 21), stale: false),
-        ProviderGauge(name: "agy", limit: Limit(pct: 1), stale: true),
+        ProviderGauge(name: "Claude", windows: [("Session", Limit(pct: 42)), ("Week", Limit(pct: 18))]),
+        ProviderGauge(name: "Codex", windows: [("5h", Limit(pct: 21)), ("Weekly", Limit(pct: 8))]),
+        ProviderGauge(name: "Agy", windows: [("daily", Limit(pct: 1)), ("weekly", Limit(pct: 61))], stale: true),
     ], collectorSick: false)
     guard let tiff = image.tiffRepresentation,
           let png = NSBitmapImageRep(data: tiff)?.representation(using: .png, properties: [:]) else {
@@ -913,7 +963,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             button.imagePosition = .imageOnly
             button.attributedTitle = NSAttributedString(string: "")
             button.image = providerGaugeGlyph([
-                ProviderGauge(name: "Claude"), ProviderGauge(name: "Codex"), ProviderGauge(name: "agy"),
+                ProviderGauge(name: "Claude", windows: [("Session", nil), ("Week", nil)]),
+                ProviderGauge(name: "Codex", windows: [("Short window", nil), ("Weekly", nil)]),
+                ProviderGauge(name: "Agy", windows: [("Short window", nil), ("Weekly", nil)]),
             ], collectorSick: false)
             button.toolTip = "Quota used — collecting readings"
             button.setAccessibilityLabel("Quota used — collecting readings")
@@ -1026,7 +1078,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             func limit(_ key: String) -> Limit {
                 guard let d = c[key] as? [String: Any] else { return Limit() }
                 return Limit(pct: d["pct"] as? Int ?? 0, resetIn: d["reset_in"] as? Int ?? 0,
-                             severity: d["severity"] as? String ?? "normal")
+                             severity: d["severity"] as? String ?? "normal",
+                             durationMins: d["duration_mins"] as? Int,
+                             cadence: d["cadence"] as? String ?? "")
             }
             s.session = limit("session"); s.weekly = limit("weekly"); s.scoped = limit("scoped")
         }
@@ -1054,7 +1108,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             tool.limits.append((entry["label"] as? String ?? "Limit",
                                 Limit(pct: entry["pct"] as? Int ?? 0,
                                       resetIn: entry["reset_in"] as? Int ?? 0,
-                                      severity: entry["severity"] as? String ?? "normal")))
+                                      severity: entry["severity"] as? String ?? "normal",
+                                      durationMins: entry["duration_mins"] as? Int,
+                                      cadence: entry["cadence"] as? String ?? "")))
         }
         // A section claiming ok with no window is the same lie as a reading with
         // no age: show the note instead of an empty gauge block.
@@ -1088,17 +1144,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     private func providerGauges() -> [ProviderGauge] {
-        let claudeLimits = [stats.session, stats.weekly, stats.scoped]
-        let claudeWorst = stats.ok ? claudeLimits.max {
-            (alertLevel($0), $0.pct) < (alertLevel($1), $1.pct)
-        } : nil
+        let weekly = [("Week", stats.weekly), (stats.scopedLabel, stats.scoped)].max {
+            (alertLevel($0.1), $0.1.pct) < (alertLevel($1.1), $1.1.pct)
+        }
         let codex = tools.first(where: { $0.name == "Codex" && $0.ok })
         let agy = tools.first(where: { $0.name == "Antigravity" && $0.ok })
         return [
-            ProviderGauge(name: "Claude", limit: claudeWorst, stale: claudeDataStale),
-            ProviderGauge(name: "Codex", limit: codex?.worst,
+            ProviderGauge(name: "Claude", windows: [
+                ("Session", stats.ok ? stats.session : nil),
+                (weekly?.0 ?? "Week", stats.ok ? weekly?.1 : nil),
+            ], stale: claudeDataStale),
+            ProviderGauge(name: "Codex", windows: codex.map { compactToolWindows($0.limits) }
+                          ?? [("Short window", nil), ("Weekly", nil)],
                           stale: codex.map { toolDataAge($0) >= 45 * 60 } ?? false),
-            ProviderGauge(name: "agy", limit: agy?.worst,
+            ProviderGauge(name: "Agy", windows: agy.map { compactToolWindows($0.limits) }
+                          ?? [("Short window", nil), ("Weekly", nil)],
                           stale: agy.map { toolDataAge($0) >= 45 * 60 } ?? false),
         ]
     }
@@ -1106,16 +1166,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     // The image stays compact; VoiceOver and the hover tooltip carry the exact
     // reading, reset and data age that a 150 pt status item cannot fit.
     private func providerDescription(_ provider: ProviderGauge) -> String {
-        guard let limit = provider.limit else { return "\(provider.name) unavailable" }
         let age: Int
         switch provider.name {
         case "Claude": age = dataAge
         case "Codex": age = tools.first(where: { $0.name == "Codex" }).map(toolDataAge) ?? -1
         default: age = tools.first(where: { $0.name == "Antigravity" }).map(toolDataAge) ?? -1
         }
+        let windows = provider.windows.map { label, limit -> String in
+            guard let limit else { return "\(label) unavailable" }
+            let reset = limit.resetIn > 0 ? ", resets in \(formatSpan(limit.resetIn))" : ""
+            return "\(label) \(limit.pct)%\(reset)"
+        }.joined(separator: "; ")
         let freshness = provider.stale ? "stale, read \(formatAge(age))" : "read \(formatAge(age))"
-        let reset = limit.resetIn > 0 ? ", resets in \(formatSpan(limit.resetIn))" : ""
-        return "\(provider.name) \(limit.pct)%\(reset), \(freshness)"
+        return "\(provider.name): \(windows), \(freshness)"
     }
 
     // MARK: Menu (rebuilt at open, so ages are computed when eyes are on them)

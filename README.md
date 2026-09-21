@@ -7,9 +7,10 @@ will actually stop you. The numbers come from the same OAuth usage endpoint
 Claude Code's `/usage` command calls, and every reading carries its age, so a
 stale one looks stale rather than passing for current.
 
-The menu bar reports the tightest quota for each installed agent: Claude,
-Codex, and Antigravity (`agy`). The dropdown shows every reported window, its
-reset time, source, and freshness. Codex is read through its app server. agy
+The menu bar reports a short-window gauge above a weekly gauge for each
+installed agent: Claude, Codex, and Antigravity (`agy`). The dropdown shows
+every reported window, its reset time, source, and freshness. Codex is read
+through its app server. agy
 sends its documented status-line payload to `agy-usage-statusline`, which keeps
 only quota percentages, reset times, model, and plan in a private cache. The
 flake installs that bridge and declares it in agy's settings; a standalone
@@ -66,9 +67,11 @@ has been tested — treat 14 to 25 as unverified.
 
 ## Use
 
-**In the menu bar:** three compact gauges, labelled `Claude`, `Codex`, and `agy`,
-show each provider's tightest quota window. An outlined track with a dash means that provider
-has not reported a quota yet. Orange means that provider is at least 75% used
+**In the menu bar:** three compact two-bar gauges, labelled `Claude`, `Codex`,
+and `Agy`, show each provider's short window above its weekly window. The bar
+uses the provider's actual window metadata: a 5-hour quota is never called
+daily, and a 30-day plan does not fill the weekly position. An outlined track
+with a dash means that provider has not reported that window. Orange means that provider is at least 75% used
 and red means that provider is at least 90% used, so one hot quota never makes
 the other gauges look urgent. A dim gauge with a tiny clock means only that
 provider's reading is stale; a red corner warning is reserved for a collector
@@ -517,8 +520,9 @@ running to 2026-11-21. Re-read before relying on any figure here.
 3. help.openai.com/en/articles/9793128, "About ChatGPT Pro tiers" — read 2026-09-21, stamped ≈2026-09-19.
 4. help.openai.com/en/articles/20001106, "ChatGPT Rate Card" — read 2026-09-21, stamped ≈2026-09-18.
 
-Codex's tightest reported window appears in the named menu-bar label alongside
-Claude and agy. Its detailed windows stay in the Codex menu section.
+Codex's short and weekly windows appear in the named menu-bar gauge alongside
+Claude and Agy when Codex reports those actual cadences. Its detailed windows,
+including a 30-day limit, stay in the Codex menu section.
 
 #### Antigravity (`agy`) — status-line quota bridge
 
