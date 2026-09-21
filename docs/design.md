@@ -14,14 +14,14 @@ read deliberately.
 
 ## The glyph
 
-Three 48 pt columns use the full `Claude`, `Codex`, and `Agy` labels at 10 pt,
-above two 43 pt horizontal gauges. The upper bar is the provider's actual short
-window and the lower bar is weekly; the label and bars form a centred 22 pt
-stack in the 150 pt status item. A 30-day or unknown cadence leaves the weekly
+Three 28 pt columns use the abbreviated `Cl`, `Cx`, and `Agy` labels at 9 pt,
+above two 22 pt horizontal gauges. The upper bar is the provider's actual short
+window and the lower bar is weekly; the label and bars form a centred 18 pt
+stack in the 84 pt status item. A 30-day or unknown cadence leaves the weekly
 bar outlined with a dash rather than being relabelled. Exact window names,
 percentages, ages, and reset times belong in the hover tooltip and dropdown.
 
-A stale provider dims only its own label and gauge and gains a tiny clock. A
+A stale provider dims only its own label and gauge and gains a small age dot. A
 red corner warning is for a collector failure, never a quota level or one
 provider's stale reading.
 
@@ -67,7 +67,7 @@ not shift the column.
 2. **Level** — muted orange at ≥75% or a `warning` severity, muted red at ≥90%
    or `critical`. It overrides the series colour, because danger is never
    traded for prettiness.
-3. **Meter health** — each provider's gauge dims and gains a tiny clock when
+3. **Meter health** — each provider's gauge dims and gains a small age dot when
    its own data is over 45 minutes old; a red corner warning is reserved for a
    collector failure affecting the meter itself.
 
